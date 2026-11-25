@@ -5,8 +5,7 @@ import { KeyValue } from '@/components/molecules';
 import { DetailPageLayout } from '@/components/templates';
 import { requireRole } from '@/domains/auth';
 import { getBranch } from '@/domains/branch';
-import { getGlobalRadius } from '@/domains/settings';
-import { formatDistance } from '@/lib/format/distance';
+import { BranchDeleteButton } from '../../../_components/branches/BranchDeleteButton';
 import { BranchForm } from '../../../_components/branches/BranchForm';
 import { BranchStatusButton } from '../../../_components/branches/BranchStatusButton';
 import { loadForPage } from '../../../_lib/page-context';
@@ -16,10 +15,7 @@ export const metadata = { title: 'Branch' };
 export default async function BranchDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { actor } = await requireRole('SUPER_ADMIN');
   const { id } = await params;
-  const [branch, globalRadius] = await Promise.all([
-    loadForPage(actor, () => getBranch(actor, id)),
-    getGlobalRadius(),
-  ]);
+  const branch = await loadForPage(actor, () => getBranch(actor, id));
 
   return (
     <DetailPageLayout
@@ -40,6 +36,7 @@ export default async function BranchDetailPage({ params }: { params: Promise<{ i
             </NextLink>
           </Button>
           <BranchStatusButton branchId={branch.id} isActive={branch.isActive} name={branch.name} />
+          {!branch.isActive && <BranchDeleteButton branchId={branch.id} name={branch.name} />}
         </>
       }
       aside={
@@ -52,10 +49,6 @@ export default async function BranchDetailPage({ params }: { params: Promise<{ i
                 label: 'Staff accounts',
                 value: <span className="numeric">{branch.staffCount}</span>,
               },
-              {
-                label: 'Matching radius',
-                value: `${formatDistance(branch.matchRadius.preferredM)} preferred · ${formatDistance(branch.matchRadius.maxM)} max${branch.matchRadius.source === 'BRANCH' ? '' : ' (global)'}`,
-              },
               { label: 'Phone', value: branch.phone },
             ]}
           />
@@ -64,7 +57,7 @@ export default async function BranchDetailPage({ params }: { params: Promise<{ i
     >
       <section className="border-border bg-surface shadow-card grid gap-4 rounded-xl border p-5">
         <h2 className="text-fg text-base font-semibold">Details</h2>
-        <BranchForm branch={branch} globalRadius={globalRadius} />
+        <BranchForm branch={branch} />
       </section>
     </DetailPageLayout>
   );

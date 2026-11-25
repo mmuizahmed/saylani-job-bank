@@ -1,8 +1,13 @@
 import {
   ageOn,
+  certificationsSchema,
   computeCompleteness,
+  educationSchema,
   experienceSchema,
   identityVerificationSchema,
+  karachiDay,
+  pkMobileSchema,
+  pkPhoneSchema,
   preferencesSchema,
   registerApplicantSchema,
   updatePersonalSchema,
@@ -57,16 +62,14 @@ describe('profile completeness', () => {
 });
 
 describe('applicant status machine', () => {
-  it('activates only when nothing is missing, and only from DRAFT', () => {
+  it('has no DRAFT state and no ACTIVATE transition: profiles are ACTIVE from creation (removed 2026-11-09)', () => {
+    expect(applicantMachine.states).toEqual(['ACTIVE', 'INACTIVE', 'RESTRICTED']);
     expect(
-      applicantMachine.check('DRAFT', 'ACTIVATE', { activationMissing: ['documents'] }, 'system'),
-    ).toMatchObject({ ok: false, message: expect.stringContaining('CNIC front and back') });
+      applicantMachine.availableEvents('ACTIVE', { activationMissing: [] }, ['APPLICANT']),
+    ).toEqual(['DEACTIVATE']);
     expect(
-      applicantMachine.check('DRAFT', 'ACTIVATE', { activationMissing: [] }, 'system'),
-    ).toEqual({ ok: true, to: 'ACTIVE' });
-    expect(
-      applicantMachine.check('ACTIVE', 'ACTIVATE', { activationMissing: [] }, 'system').ok,
-    ).toBe(false);
+      applicantMachine.availableEvents('INACTIVE', { activationMissing: [] }, ['APPLICANT']),
+    ).toEqual(['REACTIVATE']);
   });
 
   it('lets the applicant or staff pause and resume, but not employers or the system', () => {
@@ -79,10 +82,49 @@ describe('applicant status machine', () => {
     expect(applicantMachine.check('ACTIVE', 'DEACTIVATE', ctx, 'system').ok).toBe(false);
   });
 
-  it('has no way out of RESTRICTED yet (the blacklist module owns it)', () => {
+  it('restricts from ACTIVE or INACTIVE, and only admins lift it (M31)', () => {
+    const ctx = { activationMissing: [] };
+    expect(applicantMachine.transition('ACTIVE', 'RESTRICT', ctx, ['BRANCH_ADMIN'])).toBe(
+      'RESTRICTED',
+    );
+    expect(applicantMachine.transition('INACTIVE', 'RESTRICT', ctx, ['SUPER_ADMIN'])).toBe(
+      'RESTRICTED',
+    );
+    expect(applicantMachine.check('RESTRICTED', 'RESTRICT', ctx, ['STAFF']).ok).toBe(false);
+    // The applicant cannot lift their own restriction; staff cannot either.
+    expect(applicantMachine.check('RESTRICTED', 'REACTIVATE', ctx, ['APPLICANT']).ok).toBe(false);
+    expect(applicantMachine.check('RESTRICTED', 'REACTIVATE', ctx, ['STAFF']).ok).toBe(false);
+    expect(applicantMachine.transition('RESTRICTED', 'REACTIVATE', ctx, ['BRANCH_ADMIN'])).toBe(
+      'ACTIVE',
+    );
+    // …but not while the profile is incomplete.
     expect(
-      applicantMachine.availableEvents('RESTRICTED', { activationMissing: [] }, ['STAFF']),
-    ).toEqual([]);
+      applicantMachine.check('RESTRICTED', 'REACTIVATE', { activationMissing: ['documents'] }, [
+        'SUPER_ADMIN',
+      ]).ok,
+    ).toBe(false);
+    expect(applicantMachine.transition('RESTRICTED', 'DEACTIVATE', ctx, ['SUPER_ADMIN'])).toBe(
+      'INACTIVE',
+    );
+  });
+
+  it('lets a Super Admin pause and resume profiles (H20)', () => {
+    const ctx = { activationMissing: [] };
+    expect(applicantMachine.transition('ACTIVE', 'DEACTIVATE', ctx, ['SUPER_ADMIN'])).toBe(
+      'INACTIVE',
+    );
+    expect(applicantMachine.transition('INACTIVE', 'REACTIVATE', ctx, ['SUPER_ADMIN'])).toBe(
+      'ACTIVE',
+    );
+  });
+
+  it('has no DEMOTE transition: losing completeness no longer sends a profile back (removed 2026-11-09)', () => {
+    const ctx = { activationMissing: ['documents' as const] };
+    expect(applicantMachine.availableEvents('ACTIVE', ctx, 'system')).toEqual([]);
+    expect(applicantMachine.availableEvents('ACTIVE', ctx, ['SUPER_ADMIN'])).toEqual([
+      'DEACTIVATE',
+      'RESTRICT',
+    ]);
   });
 });
 
@@ -149,10 +191,8 @@ describe('section rules', () => {
     ).toBe(false);
   });
 
-  it('caps the willing radius at 10 km and rejects duplicate categories', () => {
+  it('rejects duplicate categories in preferences', () => {
     const base = { categoryCodes: ['DRIVING'], shifts: [], jobTypes: [] };
-    expect(preferencesSchema.safeParse({ ...base, willingRadiusM: 10_000 }).success).toBe(true);
-    expect(preferencesSchema.safeParse({ ...base, willingRadiusM: 10_500 }).success).toBe(false);
     expect(
       preferencesSchema.safeParse({ ...base, categoryCodes: ['DRIVING', 'DRIVING'] }).success,
     ).toBe(false);
@@ -166,5 +206,64 @@ describe('section rules', () => {
     expect(
       identityVerificationSchema.safeParse({ outcome: 'VERIFIED', method: 'IN_PERSON' }).success,
     ).toBe(true);
+  });
+
+  it('rejects a future completion year unless the education is current (L13)', () => {
+    const nextYear = new Date().getUTCFullYear() + 1;
+    const item = { levelCode: 'BACHELORS', completionYear: nextYear, isCurrent: false };
+    expect(educationSchema.safeParse({ items: [item] }).success).toBe(false);
+    expect(educationSchema.safeParse({ items: [{ ...item, isCurrent: true }] }).success).toBe(true);
+    expect(
+      educationSchema.safeParse({
+        items: [{ ...item, completionYear: new Date().getUTCFullYear() }],
+      }).success,
+    ).toBe(true);
+  });
+
+  it('rejects a certification issued in the future (L13)', () => {
+    const now = new Date();
+    const nextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
+      .toISOString()
+      .slice(0, 7);
+    expect(
+      certificationsSchema.safeParse({ items: [{ name: 'First Aid', issuedMonth: nextMonth }] })
+        .success,
+    ).toBe(false);
+    expect(
+      certificationsSchema.safeParse({
+        items: [{ name: 'First Aid', issuedMonth: now.toISOString().slice(0, 7) }],
+      }).success,
+    ).toBe(true);
+  });
+
+  it('rejects a past available-from date (L15)', () => {
+    const base = { categoryCodes: ['DRIVING'], shifts: [], jobTypes: [] };
+    const yesterday = karachiDay(new Date(Date.now() - 86_400_000));
+    expect(preferencesSchema.safeParse({ ...base, availableFrom: yesterday }).success).toBe(false);
+    expect(preferencesSchema.safeParse({ ...base, availableFrom: karachiDay() }).success).toBe(
+      true,
+    );
+  });
+});
+
+describe('phone schemas (M21)', () => {
+  it('accepts a 03xx mobile in both schemas', () => {
+    expect(pkPhoneSchema.parse('0300 1234567')).toBe('+923001234567');
+    expect(pkMobileSchema.parse('0300 1234567')).toBe('+923001234567');
+    expect(pkMobileSchema.parse('+92 300 1234567')).toBe('+923001234567');
+  });
+
+  it('accepts a landline only in the landline-tolerant schema', () => {
+    expect(pkPhoneSchema.parse('021 34567890')).toBe('+922134567890');
+    expect(pkMobileSchema.safeParse('021 34567890').success).toBe(false);
+    expect(pkMobileSchema.safeParse('0213456789').success).toBe(false);
+  });
+
+  // Audit 2026-11-11 (L-03): a valid 3xx shape with an unallocated
+  // prefix (0399) is rejected by the schema, like the input and domains.
+  it('rejects a valid-shaped number with an unallocated prefix', () => {
+    expect(pkMobileSchema.safeParse('03991234567').success).toBe(false);
+    expect(pkMobileSchema.safeParse('+923991234567').success).toBe(false);
+    expect(pkMobileSchema.parse('03451234567')).toBe('+923451234567');
   });
 });

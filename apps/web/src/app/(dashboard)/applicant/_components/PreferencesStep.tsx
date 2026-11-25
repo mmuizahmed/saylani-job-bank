@@ -10,8 +10,8 @@ import {
   type Shift,
 } from '@jobbank/shared';
 import { useState } from 'react';
-import { Checkbox, Input, Select } from '@/components/atoms';
-import { FormField } from '@/components/molecules';
+import { Checkbox, Input } from '@/components/atoms';
+import { DateTimePicker, FormField } from '@/components/molecules';
 import type { ApplicantProfile } from '@/domains/applicant';
 import { ApiClientError, apiFetch } from '@/lib/api/client';
 import {
@@ -21,8 +21,6 @@ import {
   type FieldErrors,
 } from '../../_components/applicants/form';
 import { numberOrNull, useStepSave, type StepProps } from './step';
-
-const RADIUS_CHOICES_KM = [2, 3, 5, 8, 10];
 
 function toggle<T>(list: T[], value: T, on: boolean): T[] {
   return on ? [...new Set([...list, value])] : list.filter((v) => v !== value);
@@ -65,18 +63,12 @@ function CheckboxGroup<T extends string>({
   );
 }
 
-export function PreferencesStep({
-  profile,
-  lists,
-  bindSave,
-  maxRadiusM,
-}: StepProps & { maxRadiusM: number }) {
+export function PreferencesStep({ profile, lists, bindSave }: StepProps) {
   const p = profile?.preferences;
   const [categories, setCategories] = useState<string[]>(p?.categoryCodes ?? []);
   const [shifts, setShifts] = useState<Shift[]>(p?.shifts ?? []);
   const [jobTypes, setJobTypes] = useState<JobType[]>(p?.jobTypes ?? []);
   const [minSalary, setMinSalary] = useState(p?.minSalaryPkr?.toString() ?? '');
-  const [radius, setRadius] = useState(p?.willingRadiusM?.toString() ?? '');
   const [availableFrom, setAvailableFrom] = useState(p?.availableFrom ?? '');
   const [errors, setErrors] = useState<FieldErrors>({});
   const [alert, setAlert] = useState<string | null>(null);
@@ -88,7 +80,6 @@ export function PreferencesStep({
       shifts,
       jobTypes,
       minSalaryPkr: numberOrNull(minSalary),
-      willingRadiusM: numberOrNull(radius),
       availableFrom: availableFrom || null,
     });
     if (!parsed.success) {
@@ -109,11 +100,6 @@ export function PreferencesStep({
       return null;
     }
   });
-
-  const radiusOptions = RADIUS_CHOICES_KM.filter((km) => km * 1000 <= maxRadiusM).map((km) => ({
-    value: String(km * 1000),
-    label: `Up to ${km} km`,
-  }));
 
   return (
     <div className="grid gap-6">
@@ -145,21 +131,11 @@ export function PreferencesStep({
             onChange={(e) => setMinSalary(e.target.value)}
           />
         </FormField>
-        <FormField label="How far can you travel?" error={errors.willingRadiusM}>
-          <Select
-            value={radius}
-            onChange={(e) => setRadius(e.target.value)}
-            options={[
-              { value: '', label: `As far as allowed (${maxRadiusM / 1000} km)` },
-              ...radiusOptions,
-            ]}
-          />
-        </FormField>
         <FormField label="Available from" error={errors.availableFrom} hint="Leave empty if now.">
-          <Input
-            type="date"
+          <DateTimePicker
+            mode="date"
             value={availableFrom}
-            onChange={(e) => setAvailableFrom(e.target.value)}
+            onChange={(iso) => setAvailableFrom(iso)}
           />
         </FormField>
       </div>

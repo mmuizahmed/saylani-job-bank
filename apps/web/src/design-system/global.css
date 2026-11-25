@@ -5,6 +5,155 @@
 /* Dark mode follows the data-theme attribute set by ThemeProvider (system-aware). */
 @custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
 
+.registration-form-print-root,
+.applicant-token-print-root {
+  display: none;
+}
+
+/* Token slip — centred title, big token number, detail rows, Job Bank
+   logo watermark. Compact thermal-ticket sizing, modelled on a short
+   Epson ePOS slip (centred title, divider, a few detail lines, feed,
+   cut). The width stays 80mm: that is the thermal roll's paper width.
+   Screen preview is the real 80mm paper width, so what staff see in the
+   dialog is what the roll prints. On paper the @media print rules below
+   re-lay it for the counter's BlackCopper 80mm thermal roll (72mm
+   printable width, its own named page) — do not put it back on A4. */
+.token-slip {
+  position: relative;
+  width: 100%;
+  max-width: 80mm;
+  margin: 0 auto;
+  overflow: hidden;
+  border: 1px solid #0f3557;
+  border-radius: 6px;
+  background: #fff;
+  padding: 4px 10px;
+  font-family: Arial, Helvetica, sans-serif;
+  color: #102a43;
+  box-shadow: 0 4px 12px rgb(15 53 87 / 0.12);
+  print-color-adjust: exact;
+  -webkit-print-color-adjust: exact;
+}
+
+.token-slip__watermark {
+  position: absolute;
+  left: 50%;
+  top: 54%;
+  width: 60%;
+  transform: translate(-50%, -50%);
+  opacity: 0.1;
+  pointer-events: none;
+}
+
+.token-slip__content {
+  position: relative;
+  z-index: 1;
+}
+
+.token-slip__title {
+  margin-top: 4px;
+  text-align: center;
+}
+
+.token-slip__title h1 {
+  color: #0f3557;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+.token-slip__title p {
+  margin-top: 1px;
+  color: #5a6b7a;
+  font-size: 6px;
+  letter-spacing: 0.5px;
+}
+
+.token-slip__divider {
+  height: 1px;
+  margin: 4px 0 3px;
+  border: 0;
+  background: #dbe4ea;
+}
+
+.token-slip__number {
+  text-align: center;
+}
+
+.token-slip__number-label {
+  color: #7a8a99;
+  font-size: 6px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.token-slip__number-value {
+  color: #0f3557;
+  font-size: 26px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+/* N6: four-digit token numbers (1000–9999) shrink so the slip layout holds. */
+.token-slip__number-value--wide {
+  font-size: 22px;
+  letter-spacing: -1px;
+}
+
+.token-slip__rows {
+  margin-top: 3px;
+}
+
+.token-slip__row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 1px;
+  border-bottom: 1px solid #e6edf1;
+}
+
+.token-slip__row:last-child {
+  border-bottom: 0;
+}
+
+.token-slip__key {
+  color: #6b7d8d;
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+.token-slip__value {
+  overflow-wrap: anywhere;
+  color: #102a43;
+  font-size: 8px;
+  font-weight: 800;
+  text-align: right;
+}
+
+.token-slip__footer {
+  margin-top: 4px;
+  border-top: 1px dashed #c3d2dc;
+  padding-top: 3px;
+  text-align: center;
+}
+
+.token-slip__footer p {
+  color: #43566a;
+  font-size: 6px;
+  font-style: italic;
+}
+
+.token-slip__footer small {
+  display: block;
+  margin-top: 2px;
+  color: #8ba0b0;
+  font-size: 6px;
+  font-style: normal;
+  letter-spacing: 1.5px;
+}
+
 /* Map semantic CSS variables → Tailwind colour utilities (bg-surface, text-fg-muted, …). */
 @theme inline {
   --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
@@ -68,6 +217,19 @@
     -webkit-text-size-adjust: 100%;
   }
 
+  /* Landing + dashboard pages must never scroll sideways on a phone:
+     a single wide element used to push the whole page off-screen.
+     overflow-x: clip (NOT hidden): `hidden` makes overflow-y compute to
+     `auto`, turning <body> into a scroll container — and in Chrome that
+     breaks every position:sticky element, so the dashboard sidebar and
+     top bar scrolled away with the page (staff job detail, 2026-11-10).
+     `clip` blocks sideways scrolling the same way without creating a
+     scroll container, so sticky keeps working. */
+  html,
+  body {
+    overflow-x: clip;
+  }
+
   body {
     background-color: var(--bg);
     color: var(--fg);
@@ -93,6 +255,538 @@
       animation-iteration-count: 1 !important;
       transition-duration: 0.01ms !important;
       scroll-behavior: auto !important;
+    }
+  }
+
+  .registration-print-page {
+    min-height: 100vh;
+    padding: 1.5rem;
+    background: #f1f5f2;
+    color: #17231b;
+    font-family: var(--font-sans);
+  }
+
+  .registration-print-controls {
+    display: flex;
+    max-width: 210mm;
+    justify-content: space-between;
+    gap: 1rem;
+    margin: 0 auto 1rem;
+  }
+
+  .registration-print-state {
+    display: flex;
+    max-width: 210mm;
+    align-items: center;
+    gap: 0.75rem;
+    margin: 1rem auto;
+    border: 1px solid #d5ded8;
+    border-radius: 0.75rem;
+    background: #fff;
+    padding: 1rem;
+    color: #34443a;
+  }
+
+  .registration-print-error {
+    border-color: #e9b9b9;
+    color: #8e2525;
+  }
+
+  .registration-print-document {
+    display: grid;
+    width: min(100%, 210mm);
+    gap: 1.1rem;
+    margin: 0 auto;
+    background: #fff;
+    padding: 14mm;
+    box-shadow: 0 8px 32px rgb(23 35 27 / 12%);
+    font-size: 10pt;
+  }
+
+  .registration-print-header {
+    display: grid;
+    grid-template-columns: 35mm 1fr auto;
+    align-items: center;
+    gap: 1rem;
+    border-bottom: 2px solid #14783e;
+    padding-bottom: 1rem;
+  }
+
+  /* With a photo, the header gains a fourth column at the far right. */
+  .registration-print-header--with-photo {
+    grid-template-columns: 35mm 1fr auto 35mm;
+  }
+
+  /* Applicant passport photo (2026-11-17): 35mm x 45mm, aspect kept by
+     object-fit cover — never stretched. Only rendered when a usable
+     PHOTO document exists; no photo means no slot and no gap. */
+  .registration-print-photo {
+    width: 35mm;
+    height: 45mm;
+    aspect-ratio: 35 / 45;
+    object-fit: cover;
+    border: 1px solid #14783e;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .registration-print-logo {
+    width: 35mm;
+    height: auto;
+    object-fit: contain;
+  }
+
+  .registration-print-title p:first-child {
+    margin: 0 0 0.25rem;
+    color: #14783e;
+    font-size: 13pt;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+  }
+
+  .registration-print-title h1 {
+    margin: 0;
+    font-size: 16pt;
+    line-height: 1.25;
+  }
+
+  .registration-print-title p:last-child {
+    margin: 0.3rem 0 0;
+    color: #64736a;
+    font-size: 9pt;
+  }
+
+  .registration-print-reference {
+    display: grid;
+    gap: 0.35rem;
+    text-align: right;
+    font-size: 9pt;
+  }
+
+  .registration-print-summary,
+  .registration-print-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.65rem 1rem;
+    margin: 0;
+  }
+
+  .registration-print-summary {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    border-bottom: 1px solid #d5ded8;
+    padding-bottom: 0.8rem;
+  }
+
+  .registration-print-field {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .registration-print-field dt {
+    margin-bottom: 0.15rem;
+    color: #5c6e62;
+    font-size: 8pt;
+    font-weight: 600;
+  }
+
+  .registration-print-field dd {
+    margin: 0;
+    font-size: 9.5pt;
+  }
+
+  .registration-print-section {
+    display: grid;
+    gap: 0.55rem;
+  }
+
+  .registration-print-section h2 {
+    margin: 0;
+    border-bottom: 1px solid #d5ded8;
+    padding-bottom: 0.3rem;
+    color: #14783e;
+    font-size: 11pt;
+  }
+
+  .registration-print-personal {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 1rem;
+    align-items: start;
+  }
+
+  .registration-print-photo {
+    width: 35mm;
+    aspect-ratio: 35 / 45;
+    object-fit: cover;
+    border: 1px solid #d5ded8;
+  }
+
+  .registration-print-photo--empty {
+    display: grid;
+    place-items: center;
+    padding: 0.5rem;
+    color: #5c6e62;
+    font-size: 8pt;
+    font-style: italic;
+    text-align: center;
+  }
+
+  .registration-print-empty {
+    margin: 0;
+    color: #4c5c52;
+    font-style: italic;
+  }
+
+  .registration-print-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: 9pt;
+  }
+
+  .registration-print-table th,
+  .registration-print-table td {
+    border: 1px solid #d5ded8;
+    padding: 0.4rem;
+    text-align: left;
+    vertical-align: top;
+    overflow-wrap: anywhere;
+  }
+
+  .registration-print-table th {
+    background: #edf5ef;
+    font-weight: 700;
+  }
+
+  .registration-print-list {
+    display: grid;
+    gap: 0.25rem;
+    margin: 0;
+    padding-left: 1.2rem;
+  }
+
+  .registration-print-bottom {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: end;
+    gap: 1rem;
+    margin-top: 0.5rem;
+    break-inside: avoid;
+  }
+
+  .registration-print-signatures {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1.5rem;
+  }
+
+  .registration-print-signatures > div {
+    display: grid;
+    gap: 0.8rem;
+    font-size: 8.5pt;
+  }
+
+  .registration-print-signatures i {
+    display: block;
+    height: 1px;
+    border-bottom: 1px solid #526158;
+  }
+
+  .registration-print-signatures small {
+    font-size: 8pt;
+  }
+
+  .registration-print-qr {
+    display: grid;
+    justify-items: center;
+    gap: 0.3rem;
+    text-align: center;
+    font-size: 8pt;
+  }
+
+  .registration-print-qr img {
+    width: 32mm;
+    height: 32mm;
+  }
+
+  .registration-print-footer {
+    border-top: 1px solid #d5ded8;
+    padding-top: 0.5rem;
+    color: #5c6e62;
+    font-size: 8pt;
+    text-align: center;
+  }
+
+  @page {
+    size: A4;
+    margin: 12mm;
+  }
+
+  @media print {
+    @page {
+      size: A4 portrait;
+      margin: 0.25in;
+    }
+
+    /* Token slip: the counter prints on a BlackCopper 80mm thermal roll
+       (2026-11-13) — the slip gets its own named 80mm page, so the A4
+       @page above (kept for the registration form) never forces it onto
+       an A4 sheet the roll cannot fit. 80mm paper has ~72mm printable
+       width; the roll feeds the 297mm height and the printer cuts it. */
+    @page token-slip {
+      /* The BlackCopper driver paper is 72.1mm wide (Printer 80(72.1)),
+         so the page must be 72mm too; an 80mm page shifted the slip off-centre. */
+      size: 72mm auto;
+      margin: 0;
+    }
+
+    html,
+    body {
+      width: 100% !important;
+      height: auto !important;
+      min-height: 0 !important;
+      margin: 0 !important;
+      overflow: visible !important;
+    }
+
+    body
+      > *:not(.registration-form-print-root):not(.applicant-token-print-root):not(
+        .registration-print-page
+      ):not(:has(.registration-form-print-root)):not(:has(.applicant-token-print-root)):not(
+        :has(.registration-print-page)
+      ) {
+      display: none !important;
+    }
+
+    body * {
+      visibility: hidden !important;
+    }
+
+    .registration-form-print-root,
+    .registration-form-print-root *,
+    .applicant-token-print-root,
+    .applicant-token-print-root * {
+      visibility: visible !important;
+    }
+
+    .registration-form-print-root,
+    .applicant-token-print-root {
+      display: block !important;
+      position: absolute !important;
+      top: 0 !important;
+      left: 0 !important;
+      width: 100% !important;
+      max-width: none !important;
+      overflow: visible !important;
+      background: white !important;
+    }
+
+    /* The token root must stay in flow (static): a named page does not
+       take effect on an absolutely-positioned box. In print every other
+       element is hidden anyway, so it still sits at the top of the page. */
+    .applicant-token-print-root {
+      position: static !important;
+    }
+
+    /* Token slip: the demo-styled slip, centred, on one page — laid out
+       for the 80mm thermal roll (72mm printable width), not A4. The
+       `page` property puts it on the named 80mm page above. Compact
+       like the Epson reference slip: tight padding, and the roll cuts
+       right after the footer — no long blank feed. */
+    /* Measured on a real print (2026-11-19): the BlackCopper cut off the
+       right border of a 72mm slip and printed it ~1.2mm right of centre,
+       so the slip is 64mm wide and nudged left. Top/bottom gaps come from
+       the printer (cutter distance + driver Feed Paper), not from CSS. */
+    .token-slip {
+      page: token-slip;
+      position: relative !important;
+      left: -1.2mm !important;
+      width: 64mm !important;
+      max-width: 64mm !important;
+      margin: 0 auto !important;
+      border-color: #000 !important;
+      padding: 4px 8px 3px !important;
+      box-shadow: none !important;
+      break-inside: avoid !important;
+      page-break-inside: avoid !important;
+    }
+
+    /* Thermal heads print only black: greys came out faded and 6-7px text
+       was too small. On paper everything is pure black, larger and bolder,
+       and the faint watermark is dropped. */
+    .token-slip,
+    .token-slip * {
+      color: #000 !important;
+    }
+
+    .token-slip__watermark {
+      display: none !important;
+    }
+
+    .token-slip__title h1 {
+      font-size: 14px !important;
+    }
+
+    .token-slip__title p,
+    .token-slip__number-label,
+    .token-slip__footer p,
+    .token-slip__footer small {
+      font-size: 8px !important;
+      font-weight: 700 !important;
+    }
+
+    .token-slip__number-value {
+      font-size: 32px !important;
+    }
+
+    .token-slip__key {
+      font-size: 9px !important;
+      font-weight: 700 !important;
+    }
+
+    .token-slip__value {
+      font-size: 10px !important;
+    }
+
+    .token-slip__divider {
+      background: #000 !important;
+    }
+
+    .token-slip__row {
+      border-bottom-color: #000 !important;
+    }
+
+    .token-slip__footer {
+      border-top-color: #000 !important;
+    }
+
+    .registration-form-print-sheet {
+      width: 100% !important;
+      /* A4 printable width at 0.25in margins is 7.77in. */
+      max-width: 7.7in !important;
+      margin: 0 auto !important;
+      padding: 0 !important;
+      color: #111 !important;
+      font-size: 9pt !important;
+      /* Grid containers paginate poorly in print: a grid sheet can push its
+         last items onto a near-blank second page instead of flowing. Block
+         layout flows across pages; the gap is replaced by margins below. */
+      display: block !important;
+    }
+
+    .registration-form-print-sheet > * + * {
+      margin-top: 0.12in !important;
+    }
+
+    .registration-form-section {
+      /* Sections must be allowed to break across pages: break-inside: avoid
+         on a whole section pushes it entirely to page 2 when it does not fit
+         on page 1, leaving a near-blank second page. Individual fields keep
+         break-inside: avoid below, so no single field is ever split. */
+      border-color: #555 !important;
+      padding: 0.12in !important;
+    }
+
+    .registration-form-field,
+    .registration-form-print-sheet header,
+    .registration-form-qr {
+      break-inside: avoid !important;
+      page-break-inside: avoid !important;
+    }
+
+    .registration-form-print-sheet header img {
+      display: block !important;
+      visibility: visible !important;
+    }
+
+    .registration-form-qr {
+      display: block !important;
+      width: 1.9in !important;
+      height: 1.9in !important;
+      max-width: none !important;
+      image-rendering: pixelated;
+    }
+
+    .registration-form-section h2,
+    .registration-form-section span,
+    .registration-form-print-sheet header,
+    .registration-form-print-sheet strong {
+      color: #111 !important;
+    }
+
+    /* The registration reference is a long mono string: let it wrap at any
+       character rather than overflowing (or awkwardly wrapping) its column. */
+    .registration-form-print-sheet .font-mono {
+      overflow-wrap: anywhere !important;
+    }
+
+    .registration-form-print-sheet .no-print {
+      display: none !important;
+    }
+  }
+
+  @media print {
+    html,
+    body {
+      min-height: 0 !important;
+      background: #fff !important;
+      color: #17231b !important;
+      print-color-adjust: exact;
+      -webkit-print-color-adjust: exact;
+    }
+
+    body * {
+      visibility: hidden !important;
+    }
+
+    .registration-print-document,
+    .registration-print-document *,
+    .registration-form-print-root,
+    .registration-form-print-root *,
+    .applicant-token-print-root,
+    .applicant-token-print-root * {
+      visibility: visible !important;
+    }
+
+    .registration-print-page {
+      min-height: 0;
+      padding: 0;
+      background: #fff;
+    }
+
+    .registration-print-controls,
+    .registration-print-state {
+      display: none !important;
+    }
+
+    .registration-print-document {
+      position: absolute;
+      inset: 0;
+      display: block;
+      width: 100%;
+      max-width: none;
+      margin: 0;
+      padding: 0;
+      box-shadow: none;
+      color: #17231b;
+      font-size: 9pt;
+    }
+
+    .registration-print-header,
+    .registration-print-section,
+    .registration-print-summary,
+    .registration-print-signatures {
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+
+    .registration-print-table thead {
+      display: table-header-group;
+    }
+
+    .registration-print-table tr {
+      break-inside: avoid;
+      page-break-inside: avoid;
     }
   }
 }

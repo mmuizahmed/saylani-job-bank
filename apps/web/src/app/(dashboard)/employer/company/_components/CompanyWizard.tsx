@@ -5,15 +5,35 @@ import {
   LEGAL_STRUCTURE_LABELS,
   COMPANY_SIZE_BANDS,
   COMPANY_SIZE_LABELS,
+  CITY_CENTRES,
+  RESUBMIT_NOTE_MIN_LENGTH,
+  companyContactsSchema,
+  companyHeadOfficeSchema,
+  isResubmitNoteSufficient,
+  registerCompanySchema,
+  updateCompanySchema,
   type CompanyStatus,
 } from '@jobbank/shared';
 import { ArrowLeft, ArrowRight, CheckCircle2, Send } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useEffect, useRef, useState } from 'react';
 import { Button, Badge, Input, Select, StatusPill, Textarea } from '@/components/atoms';
-import { FormField } from '@/components/molecules';
-import { ApiClientError, apiFetch } from '@/lib/api/client';
+import { ErrorBanner, FormField, PhoneInput } from '@/components/molecules';
+import { apiFetch, ApiClientError } from '@/lib/api/client';
+import { putWithProgress } from '@/lib/upload/put-with-progress';
 import type { CompanyView } from '@/domains/company';
+import { normalizePkMobile } from '@/lib/format/phone';
+import {
+  FormErrorSummary,
+  fieldControlId,
+  humanizeFieldKey,
+  useFocusFieldErrors,
+} from '../../../_components/FormErrorSummary';
+import {
+  toFieldErrors,
+  zodFieldErrors,
+  type FieldErrors,
+} from '../../../_components/applicants/form';
 
 type WizardStep = 'details' | 'contacts' | 'location' | 'documents' | 'submit';
 
@@ -95,12 +115,11 @@ interface DetailsForm {
 function DetailsStep({
   company,
   onSaved,
-  idempotencyKey,
 }: {
   company: CompanyView | null;
   onSaved: (c: CompanyView) => void;
-  idempotencyKey: string;
 }) {
+  const registrationIdempotency = useRef<{ fingerprint: string; key: string } | null>(null);
   const d = company?.details;
   const [form, setForm] = useState<DetailsForm>({
     legalName: d?.legalName ?? '',
@@ -115,7 +134,10 @@ function DetailsStep({
   });
   const [industries, setIndustries] = useState<{ code: string; label: string }[]>([]);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [errors, setErrors] = useState<FieldErrors>({});
+  const formRef = useRef<HTMLFormElement | null>(null);
+  const { requestErrorFocus, requestAlertFocus } = useFocusFieldErrors(errors, formRef, error);
 
   useEffect(() => {
     apiFetch<{ code: string; label: string }[]>('/api/v1/master-data?type=INDUSTRY')
@@ -128,26 +150,42 @@ function DetailsStep({
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
+    const body = {
+      legalName: form.legalName,
+      tradeName: form.tradeName || undefined,
+      legalStructure: form.legalStructure,
+      ntn: form.ntn,
+      registrationNo: form.registrationNo || undefined,
+      industryCode: form.industryCode,
+      sizeBand: form.sizeBand,
+      website: form.website || undefined,
+      description: form.description || undefined,
+    };
+    // Audit 2026-11-11 (L-01): validate client-side with the same schema
+    // the server enforces. Without it a bare "acme.com" was blocked by the
+    // browser's native URL check although the schema accepts it (it
+    // prepends https://), while a 7-char non-numeric NTN passed the
+    // length-only button gate and failed server-side with a generic error.
+    const parsed = (company ? updateCompanySchema : registerCompanySchema).safeParse(body);
+    if (!parsed.success) {
+      setErrors(zodFieldErrors(parsed.error));
+      requestErrorFocus();
+      return;
+    }
+    setErrors({});
     setPending(true);
     setError(null);
     try {
-      const body = {
-        legalName: form.legalName,
-        tradeName: form.tradeName || undefined,
-        legalStructure: form.legalStructure,
-        ntn: form.ntn,
-        registrationNo: form.registrationNo || undefined,
-        industryCode: form.industryCode,
-        sizeBand: form.sizeBand,
-        website: form.website || undefined,
-        description: form.description || undefined,
-      };
       let saved: CompanyView;
       if (!company) {
+        const fingerprint = JSON.stringify(body);
+        if (registrationIdempotency.current?.fingerprint !== fingerprint) {
+          registrationIdempotency.current = { fingerprint, key: crypto.randomUUID() };
+        }
         ({ data: saved } = await apiFetch<CompanyView>('/api/v1/companies/register', {
           method: 'POST',
           body,
-          idempotencyKey,
+          idempotencyKey: registrationIdempotency.current.key,
         }));
       } else {
         ({ data: saved } = await apiFetch<CompanyView>('/api/v1/companies/me', {
@@ -157,7 +195,22 @@ function DetailsStep({
       }
       onSaved(saved);
     } catch (err) {
-      setError(err instanceof ApiClientError ? err.message : 'Something went wrong.');
+      if (err instanceof ApiClientError && err.issues.length > 0) {
+        setErrors(toFieldErrors(err.issues));
+        requestErrorFocus();
+      } else if (
+        err instanceof ApiClientError &&
+        (err.details as { reason?: unknown } | null)?.reason === 'NTN_TAKEN'
+      ) {
+        // A duplicate NTN is a field problem, not a page-level one: show it
+        // on the NTN field instead of the generic alert.
+        setErrors({ ntn: err.message, ...toFieldErrors(err.issues) });
+        requestErrorFocus();
+      } else {
+        setErrors({});
+        setError(err);
+        requestAlertFocus();
+      }
     } finally {
       setPending(false);
     }
@@ -171,14 +224,42 @@ function DetailsStep({
     form.sizeBand;
 
   return (
-    <form className="grid gap-5 sm:grid-cols-2" onSubmit={(e) => void save(e)}>
-      <FormField label="Registered company name" required>
-        <Input value={form.legalName} onChange={(e) => set('legalName')(e.target.value)} />
+    <form
+      className="grid gap-5 sm:grid-cols-2"
+      noValidate
+      ref={formRef}
+      onSubmit={(e) => void save(e)}
+    >
+      <FormField
+        label="Registered company name"
+        required
+        id={fieldControlId('legalName')}
+        error={errors.legalName}
+      >
+        <Input
+          placeholder="e.g. Saylani Welfare International Trust"
+          value={form.legalName}
+          onChange={(e) => set('legalName')(e.target.value)}
+        />
       </FormField>
-      <FormField label="Trading name" hint="Leave empty if trading under the registered name">
-        <Input value={form.tradeName} onChange={(e) => set('tradeName')(e.target.value)} />
+      <FormField
+        label="Trading name"
+        hint="Leave empty if trading under the registered name"
+        id={fieldControlId('tradeName')}
+        error={errors.tradeName}
+      >
+        <Input
+          placeholder="e.g. Saylani Welfare"
+          value={form.tradeName}
+          onChange={(e) => set('tradeName')(e.target.value)}
+        />
       </FormField>
-      <FormField label="Business type" required>
+      <FormField
+        label="Business type"
+        required
+        id={fieldControlId('legalStructure')}
+        error={errors.legalStructure}
+      >
         <Select
           value={form.legalStructure}
           onChange={(e) => set('legalStructure')(e.target.value)}
@@ -186,19 +267,36 @@ function DetailsStep({
           placeholder="Choose a type"
         />
       </FormField>
-      <FormField label="NTN (National Tax Number)" required hint="e.g. 1234567-8">
-        <Input value={form.ntn} onChange={(e) => set('ntn')(e.target.value)} />
+      <FormField
+        label="NTN (National Tax Number)"
+        required
+        id={fieldControlId('ntn')}
+        error={errors.ntn}
+      >
+        <Input
+          placeholder="e.g. 1234567-8"
+          value={form.ntn}
+          onChange={(e) => set('ntn')(e.target.value)}
+        />
       </FormField>
       <FormField
         label="Registration / SECP number"
         hint="Required for private/public limited companies"
+        id={fieldControlId('registrationNo')}
+        error={errors.registrationNo}
       >
         <Input
+          placeholder="e.g. 0012345"
           value={form.registrationNo}
           onChange={(e) => set('registrationNo')(e.target.value)}
         />
       </FormField>
-      <FormField label="Industry" required>
+      <FormField
+        label="Industry"
+        required
+        id={fieldControlId('industryCode')}
+        error={errors.industryCode}
+      >
         <Select
           value={form.industryCode}
           onChange={(e) => set('industryCode')(e.target.value)}
@@ -206,7 +304,12 @@ function DetailsStep({
           placeholder="Choose an industry"
         />
       </FormField>
-      <FormField label="Company size" required>
+      <FormField
+        label="Company size"
+        required
+        id={fieldControlId('sizeBand')}
+        error={errors.sizeBand}
+      >
         <Select
           value={form.sizeBand}
           onChange={(e) => set('sizeBand')(e.target.value)}
@@ -214,7 +317,7 @@ function DetailsStep({
           placeholder="Choose a size"
         />
       </FormField>
-      <FormField label="Website">
+      <FormField label="Website" id={fieldControlId('website')} error={errors.website}>
         <Input
           type="url"
           placeholder="https://example.com"
@@ -222,14 +325,25 @@ function DetailsStep({
           onChange={(e) => set('website')(e.target.value)}
         />
       </FormField>
-      <FormField label="About the company" className="sm:col-span-2">
+      <FormField
+        label="About the company"
+        className="sm:col-span-2"
+        id={fieldControlId('description')}
+        error={errors.description}
+      >
         <Textarea
           rows={3}
+          placeholder="Briefly describe what your company does, its mission, and the kind of staff you are looking for."
           value={form.description}
           onChange={(e) => set('description')(e.target.value)}
         />
       </FormField>
-      {error && <p className="text-danger text-sm sm:col-span-2">{error}</p>}
+      <div className="sm:col-span-2">
+        <ErrorBanner error={error ?? undefined} operation="Save company" />
+      </div>
+      <div className="sm:col-span-2">
+        <FormErrorSummary errors={errors} labelFor={humanizeFieldKey} />
+      </div>
       <div className="border-border flex justify-end border-t pt-4 sm:col-span-2">
         <Button type="submit" loading={pending} disabled={!isReady} rightIcon={<ArrowRight />}>
           Save and continue
@@ -276,7 +390,10 @@ function ContactsStep({
       : [{ ...emptyContact(), isPrimary: true }],
   );
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [errors, setErrors] = useState<FieldErrors>({});
+  const formRef = useRef<HTMLFormElement | null>(null);
+  const { requestErrorFocus, requestAlertFocus } = useFocusFieldErrors(errors, formRef, error);
 
   function updateItem(index: number, key: keyof ContactForm, value: string | boolean) {
     setItems((prev) =>
@@ -289,24 +406,42 @@ function ContactsStep({
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
+    const body = {
+      items: items.map((c) => ({
+        name: c.name,
+        designation: c.designation || undefined,
+        phone: c.phone,
+        email: c.email || undefined,
+        isPrimary: c.isPrimary,
+      })),
+    };
+    // Audit 2026-11-11 (L-01): validate client-side with the same schema
+    // the server enforces, so a bad name or phone is flagged on its
+    // contact instead of failing the round trip with a generic error.
+    const parsed = companyContactsSchema.safeParse(body);
+    if (!parsed.success) {
+      setErrors(zodFieldErrors(parsed.error));
+      requestErrorFocus();
+      return;
+    }
+    setErrors({});
     setPending(true);
     setError(null);
     try {
       const { data: saved } = await apiFetch<CompanyView>('/api/v1/companies/me/contacts', {
         method: 'PUT',
-        body: {
-          items: items.map((c) => ({
-            name: c.name,
-            designation: c.designation || undefined,
-            phone: c.phone,
-            email: c.email || undefined,
-            isPrimary: c.isPrimary,
-          })),
-        },
+        body,
       });
       onSaved(saved);
     } catch (err) {
-      setError(err instanceof ApiClientError ? err.message : 'Something went wrong.');
+      if (err instanceof ApiClientError && err.issues.length > 0) {
+        setErrors(toFieldErrors(err.issues));
+        requestErrorFocus();
+      } else {
+        setErrors({});
+        setError(err);
+        requestAlertFocus();
+      }
     } finally {
       setPending(false);
     }
@@ -315,11 +450,11 @@ function ContactsStep({
   const primaryCount = items.filter((i) => i.isPrimary).length;
   const isReady =
     items.length > 0 &&
-    items.every((i) => i.name.trim().length >= 3 && i.phone.trim().length >= 10) &&
+    items.every((i) => i.name.trim().length >= 3 && normalizePkMobile(i.phone) !== null) &&
     primaryCount === 1;
 
   return (
-    <form className="grid gap-6" onSubmit={(e) => void save(e)}>
+    <form className="grid gap-6" noValidate ref={formRef} onSubmit={(e) => void save(e)}>
       <p className="text-fg-muted text-sm">
         Add the people Job Bank can contact about your company. Mark one as the main contact.
       </p>
@@ -349,26 +484,50 @@ function ContactsStep({
             </div>
           </div>
           <div className="grid gap-3 sm:grid-cols-2">
-            <FormField label="Full name" required>
-              <Input value={item.name} onChange={(e) => updateItem(idx, 'name', e.target.value)} />
-            </FormField>
-            <FormField label="Designation">
+            <FormField
+              label="Full name"
+              required
+              id={fieldControlId(`items.${idx}.name`)}
+              error={errors[`items.${idx}.name`]}
+            >
               <Input
+                placeholder="e.g. Ahmed Khan"
+                value={item.name}
+                onChange={(e) => updateItem(idx, 'name', e.target.value)}
+              />
+            </FormField>
+            <FormField
+              label="Designation"
+              id={fieldControlId(`items.${idx}.designation`)}
+              error={errors[`items.${idx}.designation`]}
+            >
+              <Input
+                placeholder="e.g. HR Manager"
                 value={item.designation}
                 onChange={(e) => updateItem(idx, 'designation', e.target.value)}
               />
             </FormField>
-            <FormField label="Phone" required>
-              <Input
-                type="tel"
-                placeholder="0300 1234567"
+            <FormField
+              label="Phone"
+              required
+              hint="Enter a 10-digit Pakistani mobile number starting with 3. The +92 prefix is fixed."
+              id={fieldControlId(`items.${idx}.phone`)}
+              error={errors[`items.${idx}.phone`]}
+            >
+              <PhoneInput
+                aria-label={`Contact ${idx + 1} phone`}
                 value={item.phone}
-                onChange={(e) => updateItem(idx, 'phone', e.target.value)}
+                onChange={(change) => updateItem(idx, 'phone', change.e164 ?? change.national)}
               />
             </FormField>
-            <FormField label="Email">
+            <FormField
+              label="Email"
+              id={fieldControlId(`items.${idx}.email`)}
+              error={errors[`items.${idx}.email`]}
+            >
               <Input
                 type="email"
+                placeholder="contact@company.com"
                 value={item.email}
                 onChange={(e) => updateItem(idx, 'email', e.target.value)}
               />
@@ -385,7 +544,8 @@ function ContactsStep({
           Add another contact
         </Button>
       )}
-      {error && <p className="text-danger text-sm">{error}</p>}
+      <ErrorBanner error={error ?? undefined} operation="Save company" />
+      <FormErrorSummary errors={errors} labelFor={humanizeFieldKey} />
       <Button
         type="submit"
         fullWidth
@@ -401,6 +561,38 @@ function ContactsStep({
 
 // ─── Location step ──────────────────────────────────────────────────────
 
+interface GeoResult {
+  lat: number;
+  lng: number;
+  addressLine: string;
+  cityCode: string | null;
+  cityLabel: string | null;
+  display: string;
+}
+
+// The wizard used to call OpenCage directly from the browser, which needs
+// NEXT_PUBLIC_OPENCAGE_API_KEY — that key is empty, so search always
+// returned [] , no suggestion could ever be picked, lat/lng stayed 0 and
+// the Save button could never enable. Use the server endpoint instead:
+// GET /api/v1/geocode/search falls back Photon -> Nominatim with no key,
+// exactly like StaffCompanyPanel and MapPinPicker already do.
+async function searchAddress(query: string): Promise<GeoResult[]> {
+  const { data } = await apiFetch<GeoResult[]>(
+    `/api/v1/geocode/search?q=${encodeURIComponent(query)}`,
+  );
+  return data ?? [];
+}
+
+/** "Rahim Yar Khan" -> "RAHIM_YAR_KHAN", matching the seeded CITY codes. A
+ * plain toUpperCase() leaves spaces in, which masterDataCodeSchema rejects. */
+function toCityCode(label: string): string {
+  return label
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
 function LocationStep({
   company,
   onSaved,
@@ -409,103 +601,292 @@ function LocationStep({
   onSaved: (c: CompanyView) => void;
 }) {
   const hq = company.headOffice;
-  const [lat, setLat] = useState(hq?.location.lat.toString() ?? '');
-  const [lng, setLng] = useState(hq?.location.lng.toString() ?? '');
+  const [lat, setLat] = useState(hq?.location.lat ?? 0);
+  const [lng, setLng] = useState(hq?.location.lng ?? 0);
   const [addressLine, setAddressLine] = useState(hq?.addressLine ?? '');
+  const [city, setCity] = useState(hq?.cityCode ?? '');
   const [cityCode, setCityCode] = useState(hq?.cityCode ?? '');
-  const [areaCode, setAreaCode] = useState(hq?.areaCode ?? '');
+  const [area, setArea] = useState(hq?.areaCode ?? '');
   const [branchId, setBranchId] = useState(company.branch?.id ?? '');
-  const [branches, setBranches] = useState<{ id: string; name: string }[]>([]);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [errors, setErrors] = useState<FieldErrors>({});
+  const formRef = useRef<HTMLFormElement | null>(null);
+  const { requestErrorFocus, requestAlertFocus } = useFocusFieldErrors(errors, formRef, error);
+  const [searchQuery, setSearchQuery] = useState(hq?.addressLine ?? '');
+  const [suggestions, setSuggestions] = useState<GeoResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searchNote, setSearchNote] = useState<string | null>(null);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Nearest branches for a pin; returns the list so save() can use it
+  // immediately instead of waiting on state.
+  async function loadBranches(
+    pinLat: number,
+    pinLng: number,
+  ): Promise<{ id: string; name: string }[]> {
+    const { data } = await apiFetch<{ id: string; name: string }[]>(
+      `/api/v1/companies/me/branch-options?lat=${pinLat}&lng=${pinLng}`,
+    );
+    const list = data ?? [];
+    if (!branchId && list.length > 0) setBranchId(list[0]!.id);
+    return list;
+  }
 
   useEffect(() => {
     if (!lat || !lng) return;
-    apiFetch<{ id: string; name: string }[]>(
-      `/api/v1/companies/me/branch-options?lat=${lat}&lng=${lng}`,
-    )
-      .then((res) => {
-        setBranches(res.data);
-        if (!branchId && res.data.length > 0) setBranchId(res.data[0]!.id);
-      })
-      .catch(() => undefined);
+    loadBranches(lat, lng).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lat, lng]);
+
+  function onSearchChange(value: string) {
+    setSearchQuery(value);
+    setSearchNote(null);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (value.trim().length < 3) {
+      setSuggestions([]);
+      setShowSuggestions(false);
+      return;
+    }
+    debounceRef.current = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const results = await searchAddress(value);
+        setSuggestions(results);
+        setShowSuggestions(results.length > 0);
+        if (results.length === 0) {
+          setSearchNote(
+            'No matching address found — pick a nearby area or landmark, or type the full address below and save.',
+          );
+        }
+      } catch {
+        setSuggestions([]);
+        setShowSuggestions(false);
+        setSearchNote(
+          'Address search is unavailable right now — type the full address below and save, it will be located then.',
+        );
+      } finally {
+        setSearching(false);
+      }
+    }, 500);
+  }
+
+  function pickSuggestion(r: GeoResult) {
+    setLat(r.lat);
+    setLng(r.lng);
+    setAddressLine(r.display || r.addressLine);
+    setSearchQuery(r.display || r.addressLine);
+    // The City field is manual (2026-11-13): a picked suggestion must NOT
+    // overwrite it. Search results sometimes come back in Urdu, and the
+    // city the employer typed is the one that gets saved.
+    setSearchNote(null);
+    setSuggestions([]);
+    setShowSuggestions(false);
+  }
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
     setPending(true);
     setError(null);
     try {
+      // Fallback for a manually typed address: coordinates only ever came
+      // from picking a suggestion, so typing the address + city (as in the
+      // reported screenshot) could never enable the button. Locate the
+      // typed address on save instead of leaving the user stuck.
+      let useLat = lat;
+      let useLng = lng;
+      const useCityCode = cityCode || toCityCode(city);
+      let useBranchId = branchId;
+      if (useLat === 0 || useLng === 0) {
+        const query = [addressLine.trim(), city.trim()].filter(Boolean).join(', ');
+        let first: GeoResult | null = null;
+        try {
+          const results = await searchAddress(query || searchQuery.trim());
+          first = results[0] ?? null;
+        } catch {
+          first = null;
+        }
+        if (first) {
+          useLat = first.lat;
+          useLng = first.lng;
+          setLat(first.lat);
+          setLng(first.lng);
+          // Coordinates only — the city stays exactly what the employer
+          // typed (2026-11-13). A geocode result's city can come back in
+          // Urdu, which must never overwrite the manual City field.
+        } else {
+          // Geocode returned nothing or is unreachable — fall back to the
+          // typed city's centre instead of leaving the user stuck again
+          // with an error. Only unknown cities still error out.
+          const centre = CITY_CENTRES[useCityCode];
+          if (!centre) {
+            throw new Error(
+              "Couldn't locate this address. Pick one of the search suggestions, or try a nearby area or landmark.",
+            );
+          }
+          useLat = centre.lat;
+          useLng = centre.lng;
+          setLat(centre.lat);
+          setLng(centre.lng);
+        }
+      }
+      if (!useBranchId) {
+        const options = await loadBranches(useLat, useLng);
+        if (options.length === 0) {
+          throw new Error('No Job Bank branch was found near this address.');
+        }
+        useBranchId = options[0]!.id;
+        setBranchId(useBranchId);
+      }
+      // Area is a free-text input ("DHA Phase 5"), but the backend expects
+      // a master-data AREA code — sending the typed text 422s the whole
+      // save (assertCityArea). Only send it when it already looks like a
+      // code (e.g. a stored KARACHI_GULSHAN_E_IQBAL left untouched); the
+      // typed area still lives in the saved address line.
+      const areaCodeToSend =
+        area.trim() && /^[A-Z0-9_]+$/.test(area.trim().toUpperCase())
+          ? area.trim().toUpperCase()
+          : undefined;
+      const body = {
+        location: { lat: useLat, lng: useLng },
+        addressLine,
+        cityCode: useCityCode,
+        areaCode: areaCodeToSend,
+        branchId: useBranchId,
+      };
+      // Audit 2026-11-11 (L-01): validate the resolved body client-side
+      // with the same schema the server enforces, so a missing city code
+      // or branch is flagged on its field instead of failing the round
+      // trip with a generic error.
+      const parsed = companyHeadOfficeSchema.safeParse(body);
+      if (!parsed.success) {
+        setErrors(zodFieldErrors(parsed.error));
+        requestErrorFocus();
+        return;
+      }
+      setErrors({});
       const { data: saved } = await apiFetch<CompanyView>('/api/v1/companies/me/head-office', {
         method: 'PUT',
-        body: {
-          location: { lat: parseFloat(lat), lng: parseFloat(lng) },
-          addressLine,
-          cityCode,
-          areaCode: areaCode || undefined,
-          branchId,
-        },
+        body,
       });
       onSaved(saved);
     } catch (err) {
-      setError(err instanceof ApiClientError ? err.message : 'Something went wrong.');
+      if (err instanceof ApiClientError && err.issues.length > 0) {
+        setErrors(toFieldErrors(err.issues));
+        requestErrorFocus();
+      } else {
+        setErrors({});
+        setError(err);
+        requestAlertFocus();
+      }
     } finally {
       setPending(false);
     }
   }
 
-  const isReady = lat && lng && addressLine.trim().length >= 5 && cityCode && branchId;
+  const hasCoords = lat !== 0 && lng !== 0;
+  // Address + city is enough to enable the button; save() locates the
+  // typed address when no pin was picked yet. Requiring coords + branch
+  // up front is what deadlocked the step.
+  const isReady = addressLine.trim().length >= 5 && city.trim().length >= 2;
 
   return (
-    <form className="grid gap-4" onSubmit={(e) => void save(e)}>
-      <p className="text-fg-muted text-sm">
-        Enter your head office location. Job Bank will suggest the nearest branch.
-      </p>
-      <div className="grid gap-3 sm:grid-cols-2">
-        <FormField label="Latitude" required hint="e.g. 24.8607">
+    <form className="grid gap-4" noValidate ref={formRef} onSubmit={(e) => void save(e)}>
+      <p className="text-fg-muted text-sm">Add your head office address.</p>
+
+      {/* Address search */}
+      <div className="relative">
+        {/* Not "required": this is only a search box — the saved address is
+            "Full address" below. As a required input it blocked native form
+            submission whenever it was empty, so an enabled Save button did
+            nothing on click. */}
+        <FormField label="Search address">
           <Input
-            type="number"
-            step="any"
-            value={lat}
-            onChange={(e) => setLat(e.target.value)}
-            placeholder="24.8607"
+            placeholder="Type your office address, e.g. DHA Phase 5, Karachi"
+            value={searchQuery}
+            onChange={(e) => onSearchChange(e.target.value)}
+            onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
+            onFocus={() => suggestions.length > 0 && setShowSuggestions(true)}
           />
         </FormField>
-        <FormField label="Longitude" required hint="e.g. 67.0011">
-          <Input
-            type="number"
-            step="any"
-            value={lng}
-            onChange={(e) => setLng(e.target.value)}
-            placeholder="67.0011"
-          />
-        </FormField>
+        {searching && <p className="text-fg-muted mt-1 text-xs">Searching…</p>}
+        {!searching && searchNote && <p className="text-fg-muted mt-1 text-xs">{searchNote}</p>}
+        {showSuggestions && (
+          <ul className="border-border bg-surface absolute top-full z-10 mt-1 w-full overflow-hidden rounded-xl border shadow-lg">
+            {suggestions.map((r, i) => (
+              <li key={i}>
+                <button
+                  type="button"
+                  className="hover:bg-surface-muted w-full px-4 py-2.5 text-left text-sm"
+                  onMouseDown={() => pickSuggestion(r)}
+                >
+                  {r.display || r.addressLine}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
-      <FormField label="Address" required>
+
+      {hasCoords && (
+        <p className="text-fg-muted text-xs">
+          Coordinates: {lat.toFixed(6)}, {lng.toFixed(6)}
+        </p>
+      )}
+
+      <FormField
+        label="Full address"
+        required
+        id={fieldControlId('addressLine')}
+        error={errors.addressLine}
+      >
         <Input
-          placeholder="Building, street, area"
+          placeholder="Building name, street, area"
           value={addressLine}
           onChange={(e) => setAddressLine(e.target.value)}
         />
       </FormField>
+
       <div className="grid gap-3 sm:grid-cols-2">
-        <FormField label="City code" required hint="Master data city code">
-          <Input value={cityCode} onChange={(e) => setCityCode(e.target.value)} />
-        </FormField>
-        <FormField label="Area code">
-          <Input value={areaCode} onChange={(e) => setAreaCode(e.target.value)} />
-        </FormField>
-      </div>
-      {branches.length > 0 && (
-        <FormField label="Branch" required>
-          <Select
-            value={branchId}
-            onChange={(e) => setBranchId(e.target.value)}
-            options={branches.map((b) => ({ value: b.id, label: b.name }))}
+        <FormField
+          label="City"
+          required
+          hint="Type the city yourself — it is not filled in from the address search."
+          id={fieldControlId('cityCode')}
+          error={errors.cityCode}
+        >
+          <Input
+            placeholder="e.g. Karachi"
+            value={city}
+            onChange={(e) => {
+              setCity(e.target.value);
+              // Typed city, not a picked suggestion — drop the old code so
+              // save() resolves the city from what is typed now.
+              setCityCode('');
+            }}
           />
         </FormField>
+        <FormField label="Area" id={fieldControlId('areaCode')} error={errors.areaCode}>
+          <Input
+            placeholder="e.g. DHA Phase 5"
+            value={area}
+            onChange={(e) => setArea(e.target.value)}
+          />
+        </FormField>
+      </div>
+
+      {/* The branch is assigned automatically from the address and never
+          shown here (2026-11-13): the employer must not see or pick a
+          "Nearest Job Bank branch". loadBranches() still runs so save()
+          has a branchId; the select below was removed, not the lookup. */}
+      <ErrorBanner error={error ?? undefined} operation="Save company" />
+      <FormErrorSummary errors={errors} labelFor={humanizeFieldKey} />
+      {!hasCoords && isReady && (
+        <p className="text-fg-muted text-xs">
+          No suggestion picked — we&apos;ll locate this address when you save.
+        </p>
       )}
-      {error && <p className="text-danger text-sm">{error}</p>}
       <Button
         type="submit"
         fullWidth
@@ -521,6 +902,12 @@ function LocationStep({
 
 // ─── Documents step ─────────────────────────────────────────────────────
 
+/** What each side of the authorised person's CNIC needs (migration 0040). */
+const DOCUMENT_HINTS: Record<string, string> = {
+  AUTHORISED_PERSON_CNIC_FRONT: 'Upload a clear photo of the front of the CNIC.',
+  AUTHORISED_PERSON_CNIC_BACK: 'Upload a clear photo of the back of the CNIC.',
+};
+
 function DocumentsStep({
   company,
   onSaved,
@@ -529,8 +916,39 @@ function DocumentsStep({
   onSaved: (c: CompanyView) => void;
 }) {
   const [uploading, setUploading] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [company_, setCompany_] = useState(company);
+  const [previews, setPreviews] = useState<Record<string, string>>({});
+
+  function previewFile(typeCode: string, file: File) {
+    if (!file.type.startsWith('image/')) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      if (ev.target?.result)
+        setPreviews((p) => ({ ...p, [typeCode]: ev.target!.result as string }));
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // The file name is never checked: phone photos are usually named
+  // IMG_1234.jpg, and the old CNIC name check ("cnic|id|nic|identity")
+  // rejected those outright, so CNIC uploads failed while NTN/SECP went
+  // through. Only size and type are checked; the server enforces the same
+  // rules from the document type's own meta on presign.
+  function validateDocument(typeCode: string, file: File): string | null {
+    const MAX_SIZE = 5 * 1024 * 1024;
+    if (file.size > MAX_SIZE) return 'File is too large. Maximum size is 5 MB.';
+    if (typeCode.startsWith('AUTHORISED_PERSON_CNIC')) {
+      // CNIC front/back are photos, like the applicant-side CNIC_FRONT /
+      // CNIC_BACK types: JPG or PNG only, no PDF.
+      if (!['image/jpeg', 'image/png'].includes(file.type))
+        return 'Upload a JPG or PNG photo of the CNIC.';
+      return null;
+    }
+    const allowed = ['image/jpeg', 'image/png', 'application/pdf'];
+    if (!allowed.includes(file.type)) return 'Only JPG, PNG, or PDF files are accepted.';
+    return null;
+  }
 
   async function upload(typeCode: string, file: File) {
     setUploading(typeCode);
@@ -538,14 +956,25 @@ function DocumentsStep({
     try {
       const { data: presign } = await apiFetch<{
         documentId: string;
-        upload: { url: string; fields: Record<string, string> };
+        upload: { url: string; headers?: Record<string, string> };
       }>('/api/v1/companies/me/documents', {
         method: 'POST',
         body: { typeCode, fileName: file.name, contentType: file.type, sizeBytes: file.size },
       });
 
-      const r = await fetch(presign.upload.url, { method: 'PUT', body: file });
-      if (!r.ok) throw new Error('Upload to storage failed');
+      // 2026-11-13 ("Failed to fetch" in this step): the old code did a
+      // bare fetch() PUT with none of the upload headers, while the
+      // applicant and staff uploaders both use putWithProgress with
+      // presign.upload.headers — the server checks the Content-Type
+      // against the approved upload, so the PUT could be rejected, and
+      // any network failure surfaced as the raw browser "Failed to fetch".
+      // Use the same helper as everywhere else: the upload headers, and a
+      // readable "Network error during upload" / "Upload failed (HTTP …)" instead.
+      await putWithProgress({
+        url: presign.upload.url,
+        file,
+        headers: presign.upload.headers,
+      });
 
       const { data: saved } = await apiFetch<CompanyView>(
         `/api/v1/companies/me/documents/${presign.documentId}/confirm`,
@@ -553,61 +982,101 @@ function DocumentsStep({
       );
       setCompany_(saved);
     } catch (err) {
-      setError(err instanceof ApiClientError ? err.message : 'Upload failed. Try again.');
+      setError(err);
     } finally {
       setUploading(null);
     }
   }
 
+  // Optional documents (NTN certificate, SECP registration, address
+  // proof since 2026-11-13) render in the same list with an "Optional"
+  // badge instead of "Required" — uploadable, never blocking submit.
+  const optionalDocuments = company_.optionalDocuments ?? [];
+
+  function renderDocument(code: string, required: boolean) {
+    const uploaded = company_.documents.find(
+      (d) => d.typeCode === code && d.reviewStatus !== 'REJECTED',
+    );
+    const hint = DOCUMENT_HINTS[code];
+    return (
+      <div key={code} className="border-border grid gap-2 rounded-xl border p-4">
+        <div className="flex items-center justify-between">
+          <span className="text-fg text-sm font-medium">{code.replace(/_/g, ' ')}</span>
+          {uploaded ? (
+            <Badge tone="success">Uploaded</Badge>
+          ) : required ? (
+            <Badge tone="neutral">Required</Badge>
+          ) : (
+            <Badge tone="neutral">Optional</Badge>
+          )}
+        </div>
+        {hint && <p className="text-fg-muted text-xs">{hint}</p>}
+        {!required && !uploaded && (
+          <p className="text-fg-muted text-xs">Optional — you can submit without it.</p>
+        )}
+        {uploaded && (
+          <p className="text-fg-muted text-xs">
+            {uploaded.fileName}
+            {uploaded.reviewStatus === 'ACCEPTED' && ' · Accepted by verifier'}
+          </p>
+        )}
+        {previews[code] && (
+          // Audit 2026-11-11 (L-37): kept as <img> — this is a data: URL
+          // of bytes the user just uploaded (FileReader), with unknown
+          // dimensions; there is nothing for next/image to optimise and
+          // no width/height to give it.
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={previews[code]}
+            alt={`Preview of ${code.replace(/_/g, ' ')}`}
+            className="mt-1 h-20 w-auto rounded-lg object-cover"
+          />
+        )}
+        <label className="cursor-pointer">
+          <input
+            type="file"
+            id={`company-document-upload-${code}`}
+            name={`company-document-upload-${code}`}
+            accept={
+              code.startsWith('AUTHORISED_PERSON_CNIC') ? '.jpg,.jpeg,.png' : '.pdf,.jpg,.jpeg,.png'
+            }
+            className="sr-only"
+            disabled={uploading === code}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              const problem = validateDocument(code, file);
+              if (problem) {
+                setError(problem);
+                return;
+              }
+              setError(null);
+              previewFile(code, file);
+              void upload(code, file);
+            }}
+          />
+          <span className="text-accent text-sm underline underline-offset-4">
+            {uploading === code ? 'Uploading…' : uploaded ? 'Replace' : 'Upload'}
+          </span>
+        </label>
+      </div>
+    );
+  }
+
   return (
     <div className="grid gap-4">
       <p className="text-fg-muted text-sm">
-        Upload the required documents. Accepted formats: PDF, JPG or PNG, up to 5 MB each.
+        Upload the required documents. Accepted formats: PDF, JPG or PNG, up to 5 MB each. Documents
+        marked Optional can be skipped.
       </p>
-      {company_.requiredDocuments.length === 0 && (
+      {company_.requiredDocuments.length === 0 && optionalDocuments.length === 0 && (
         <p className="text-fg-muted text-sm">
           No documents required for your business type yet. Continue to submit.
         </p>
       )}
-      {company_.requiredDocuments.map((code) => {
-        const uploaded = company_.documents.find(
-          (d) => d.typeCode === code && d.reviewStatus !== 'REJECTED',
-        );
-        return (
-          <div key={code} className="border-border grid gap-2 rounded-xl border p-4">
-            <div className="flex items-center justify-between">
-              <span className="text-fg text-sm font-medium">{code.replace(/_/g, ' ')}</span>
-              {uploaded ? (
-                <Badge tone="success">Uploaded</Badge>
-              ) : (
-                <Badge tone="neutral">Required</Badge>
-              )}
-            </div>
-            {uploaded && (
-              <p className="text-fg-muted text-xs">
-                {uploaded.fileName}
-                {uploaded.reviewStatus === 'ACCEPTED' && ' · Accepted by verifier'}
-              </p>
-            )}
-            <label className="cursor-pointer">
-              <input
-                type="file"
-                accept=".pdf,.jpg,.jpeg,.png"
-                className="sr-only"
-                disabled={uploading === code}
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) void upload(code, file);
-                }}
-              />
-              <span className="text-accent text-sm underline underline-offset-4">
-                {uploading === code ? 'Uploading…' : uploaded ? 'Replace' : 'Upload'}
-              </span>
-            </label>
-          </div>
-        );
-      })}
-      {error && <p className="text-danger text-sm">{error}</p>}
+      {company_.requiredDocuments.map((code) => renderDocument(code, true))}
+      {optionalDocuments.map((code) => renderDocument(code, false))}
+      <ErrorBanner error={error ?? undefined} operation="Save company" />
       <Button
         onClick={() => onSaved(company_)}
         fullWidth
@@ -625,30 +1094,41 @@ function DocumentsStep({
 function SubmitStep({
   company,
   onSubmitted,
-  idempotencyKey,
 }: {
   company: CompanyView;
   onSubmitted: (c: CompanyView) => void;
-  idempotencyKey: string;
 }) {
+  const idempotencyKey = useRef<string | null>(null);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [noteError, setNoteError] = useState<string | null>(null);
+  const [note, setNote] = useState('');
   const pill = STATUS_PILL[company.status];
 
   const canSubmit = company.status === 'DRAFT' || company.status === 'REJECTED';
   const canResubmit = company.status === 'INFO_REQUESTED';
 
+  // M18: sending back needs a note saying what changed, or a document uploaded
+  // after the verifier's request — otherwise an unchanged company would bounce
+  // back and burn a fresh SLA.
+  const infoRequestedAt = company.verification?.infoRequestedAt ?? null;
+  const hasNewDocument =
+    !!infoRequestedAt &&
+    company.documents.some((d) => !!d.uploadedAt && d.uploadedAt > infoRequestedAt);
+  const canSendBack = isResubmitNoteSufficient(note) || hasNewDocument;
+
   async function submit() {
     setPending(true);
     setError(null);
     try {
+      idempotencyKey.current ??= crypto.randomUUID();
       const { data: saved } = await apiFetch<CompanyView>('/api/v1/companies/me/submit', {
         method: 'POST',
-        idempotencyKey,
+        idempotencyKey: idempotencyKey.current,
       });
       onSubmitted(saved);
     } catch (err) {
-      setError(err instanceof ApiClientError ? err.message : 'Something went wrong.');
+      setError(err);
     } finally {
       setPending(false);
     }
@@ -657,14 +1137,18 @@ function SubmitStep({
   async function resubmit() {
     setPending(true);
     setError(null);
+    setNoteError(null);
     try {
       const { data: saved } = await apiFetch<CompanyView>('/api/v1/companies/me/resubmit', {
         method: 'POST',
-        body: { note: null },
+        body: { note: note.trim() || null },
       });
       onSubmitted(saved);
     } catch (err) {
-      setError(err instanceof ApiClientError ? err.message : 'Something went wrong.');
+      // A too-short note is a field error on the note box, not a page error.
+      const noteIssue = err instanceof ApiClientError ? err.issueFor('note') : undefined;
+      if (noteIssue) setNoteError(noteIssue);
+      else setError(err);
     } finally {
       setPending(false);
     }
@@ -714,7 +1198,26 @@ function SubmitStep({
         </div>
       )}
 
-      {error && <p className="text-danger text-sm">{error}</p>}
+      {canResubmit && (
+        <FormField
+          label="What did you change or send?"
+          error={noteError ?? undefined}
+          hint={
+            hasNewDocument
+              ? 'A document you uploaded after the request is attached — you can send it back now, or add a note as well.'
+              : `Write at least ${RESUBMIT_NOTE_MIN_LENGTH} characters so the verifier knows what changed.`
+          }
+        >
+          <Textarea
+            rows={3}
+            placeholder="e.g. Uploaded the renewed NTN certificate and corrected the head office address."
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+          />
+        </FormField>
+      )}
+
+      <ErrorBanner error={error ?? undefined} operation="Save company" />
 
       {canSubmit && (
         <Button
@@ -728,7 +1231,13 @@ function SubmitStep({
         </Button>
       )}
       {canResubmit && (
-        <Button fullWidth loading={pending} leftIcon={<Send />} onClick={() => void resubmit()}>
+        <Button
+          fullWidth
+          loading={pending}
+          disabled={!canSendBack}
+          leftIcon={<Send />}
+          onClick={() => void resubmit()}
+        >
           Send back to verifier
         </Button>
       )}
@@ -752,7 +1261,6 @@ export function CompanyWizard({
   initialCompany: CompanyView | null;
 }) {
   const router = useRouter();
-  const idempotencyKey = useRef(crypto.randomUUID());
   const [company, setCompany] = useState<CompanyView | null>(initialCompany);
   const [currentStep, setCurrentStep] = useState<WizardStep>(() => {
     const valid = STEPS.map((s) => s.id);
@@ -854,9 +1362,7 @@ export function CompanyWizard({
           </div>
           <p className="text-fg-muted text-sm">{activeStep.description}</p>
         </div>
-        {currentStep === 'details' && (
-          <DetailsStep company={company} onSaved={saved} idempotencyKey={idempotencyKey.current} />
-        )}
+        {currentStep === 'details' && <DetailsStep company={company} onSaved={saved} />}
         {currentStep === 'contacts' && company && (
           <ContactsStep company={company} onSaved={saved} />
         )}
@@ -869,7 +1375,6 @@ export function CompanyWizard({
         {currentStep === 'submit' && company && (
           <SubmitStep
             company={company}
-            idempotencyKey={idempotencyKey.current}
             onSubmitted={(c) => {
               setCompany(c);
             }}

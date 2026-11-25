@@ -6,8 +6,6 @@ import Redis from 'ioredis';
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 const BASE_URL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://localhost:3000';
-/** Mirrors `packages/db/src/seed/dev-data.ts` — the seeded development password. */
-const DEV_PASSWORD = 'JobBank-Dev-2026!';
 
 /** Public pages that must be compiled before the first assertion on them. */
 const PUBLIC_ROUTES = ['/', '/login', '/register', '/forbidden'];
@@ -54,7 +52,7 @@ async function clearRateLimits(): Promise<void> {
         cleared += keys.length;
       }
     } while (cursor !== '0');
-    console.log(`[global-setup] cleared ${cleared} rate-limit counter(s)`);
+    console.info(`[global-setup] cleared ${cleared} rate-limit counter(s)`);
   } catch (error) {
     // Never fail the run because cleanup could not talk to Redis.
     console.warn(`[global-setup] could not clear rate limits: ${String(error)}`);
@@ -75,6 +73,16 @@ async function waitForServer(timeoutMs = 120_000): Promise<boolean> {
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
   return false;
+}
+
+function getSeedDevPassword(): string {
+  const password = process.env.SEED_DEV_PASSWORD;
+  if (!password || password.length < 10) {
+    throw new Error(
+      'SEED_DEV_PASSWORD must be set to at least 10 characters in .env (see .env.example) — local dev seed password, never production.',
+    );
+  }
+  return password;
 }
 
 async function warmRoutes(): Promise<void> {
@@ -105,7 +113,7 @@ async function warmRoutes(): Promise<void> {
     const response = await fetch(`${BASE_URL}/api/v1/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'staff.khi@jobbank.local', password: DEV_PASSWORD }),
+      body: JSON.stringify({ email: 'staff.khi@jobbank.local', password: getSeedDevPassword() }),
     });
     const setCookie = response.headers.getSetCookie?.() ?? [];
     cookie = setCookie.map((entry) => entry.split(';')[0]).join('; ') || undefined;
@@ -116,5 +124,5 @@ async function warmRoutes(): Promise<void> {
 
   for (const route of PROTECTED_ROUTES) await get(route, cookie);
 
-  console.log(`[global-setup] warmed ${warmed.size} route(s)`);
+  console.info(`[global-setup] warmed ${warmed.size} route(s)`);
 }

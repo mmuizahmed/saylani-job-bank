@@ -2,20 +2,31 @@
 
 import { useState, useTransition } from 'react';
 import {
+  BONUS_TIER_LABELS,
+  GENDER_PREFERENCE_LABELS,
   JOB_STATUS_LABELS,
   JOB_TYPE_LABELS,
+  MEDICAL_COVERAGE_LABELS,
   SHIFT_TYPE_LABELS,
-  GENDER_PREFERENCE_LABELS,
 } from '@jobbank/shared';
+// eslint-disable-next-line no-restricted-imports
 import type { JobView } from '@/domains/job/repository';
-import { apiFetch } from '@/lib/api/client';
+import { apiFetch, friendlyApiError } from '@/lib/api/client';
 import { Badge, Button, Link } from '@/components/atoms';
-import { allowedTransitions } from '@/domains/job/rules';
+import { Modal } from '@/components/molecules';
+// The job barrel re-exports server-only modules (profile.ts, staff.ts), so
+// a client component cannot import from '@/domains/job' — webpack pulls the
+// whole barrel graph and the build fails on 'server-only'. Import the
+// client-safe machine module directly instead.
+// eslint-disable-next-line no-restricted-imports
+import { allowedTransitions } from '@/domains/job/machine';
 import { useRouter } from 'next/navigation';
-import { Pencil, Trash2, Users } from 'lucide-react';
+import { ArrowLeft, Pencil, Trash2, Users } from 'lucide-react';
 
 interface Props {
   job: JobView;
+  /** Where the employer screens live: staff consoles use their own path. */
+  basePath?: string;
 }
 
 const STATUS_BADGE: Record<
@@ -35,6 +46,7 @@ const TRANSITION_LABELS: Record<string, string> = {
   pause: 'Pause',
   resume: 'Resume',
   close: 'Close',
+  reopen: 'Reopen',
 };
 
 const TRANSITION_STATUS: Record<string, string> = {
@@ -42,6 +54,7 @@ const TRANSITION_STATUS: Record<string, string> = {
   pause: 'PAUSED',
   resume: 'OPEN',
   close: 'CLOSED',
+  reopen: 'OPEN',
 };
 
 function KV({ label, value }: { label: string; value: string | number | null | undefined }) {
@@ -53,13 +66,18 @@ function KV({ label, value }: { label: string; value: string | number | null | u
   );
 }
 
-export function JobDetailPanel({ job }: Props) {
+export function JobDetailPanel({ job, basePath = '/employer' }: Props) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   const transitions = allowedTransitions(job.status);
   const pill = STATUS_BADGE[job.status] ?? { tone: 'neutral' as const };
+  // Mirrors jobEditability() on the server (DRAFT / OPEN / PAUSED). Edit used to show for DRAFT
+  // only, so a company could not fix a live job, e.g. one a verifier posted for it.
+  // rules.ts is server-only, so the check is repeated here.
+  const canEdit = job.status === 'DRAFT' || job.status === 'OPEN' || job.status === 'PAUSED';
 
   function handleTransition(transition: string) {
     startTransition(async () => {
@@ -71,54 +89,73 @@ export function JobDetailPanel({ job }: Props) {
         });
         router.refresh();
       } catch (e) {
-        setError(e instanceof Error ? e.message : 'Something went wrong.');
+        setError(friendlyApiError(e));
       }
     });
   }
 
   function handleDelete() {
+    // Audit 2026-11-10 (M19): deleting a draft was one click with no
+    // confirmation. The modal below asks first; this only runs from it.
+    setShowDeleteConfirm(false);
     startTransition(async () => {
       setError(null);
       try {
         await apiFetch<{ deleted: boolean }>(`/api/v1/jobs/me/${job.id}`, { method: 'DELETE' });
-        router.push('/employer/jobs');
+        router.push(`${basePath}/jobs`);
       } catch (e) {
-        setError(e instanceof Error ? e.message : 'Something went wrong.');
+        setError(friendlyApiError(e));
       }
     });
   }
 
   return (
     <div className="grid w-full gap-6">
-      <header className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-fg text-2xl font-semibold">{job.title}</h1>
-          <p className="text-fg-muted mt-1 text-sm">{job.categoryCode}</p>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <Badge tone={pill.tone}>{JOB_STATUS_LABELS[job.status]}</Badge>
-          <Link href={`/employer/jobs/${job.id}/matches`}>
-            <Button size="sm" variant="secondary">
-              <Users className="mr-1.5 size-4" />
-              Shortlist
-            </Button>
-          </Link>
-          {job.status === 'DRAFT' && (
-            <>
-              <Link href={`/employer/jobs/${job.id}/edit`}>
+      <div>
+        <Link
+          href={`${basePath}/jobs`}
+          variant="unstyled"
+          className="text-fg-muted mb-3 flex items-center gap-1 text-sm hover:underline"
+        >
+          <ArrowLeft className="size-4" />
+          Back to Jobs
+        </Link>
+        <header className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-fg text-2xl font-semibold">{job.title}</h1>
+            <p className="text-fg-muted mt-1 text-sm">{job.categoryCode}</p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Badge tone={pill.tone}>{JOB_STATUS_LABELS[job.status]}</Badge>
+            <Link href={`${basePath}/jobs/${job.id}/matches`}>
+              <Button size="sm" variant="secondary">
+                <Users className="mr-1.5 size-4" />
+                Shortlist
+              </Button>
+            </Link>
+            {canEdit && (
+              <Link href={`${basePath}/jobs/${job.id}/edit`}>
                 <Button size="sm" variant="secondary">
                   <Pencil className="mr-1.5 size-4" />
                   Edit
                 </Button>
               </Link>
-              <Button size="sm" variant="secondary" onClick={handleDelete} disabled={pending}>
+            )}
+            {/* Delete stays draft-only, as deleteJob enforces on the server. */}
+            {job.status === 'DRAFT' && (
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => setShowDeleteConfirm(true)}
+                disabled={pending}
+              >
                 <Trash2 className="text-danger mr-1.5 size-4" />
                 Delete
               </Button>
-            </>
-          )}
-        </div>
-      </header>
+            )}
+          </div>
+        </header>
+      </div>
 
       <div className="border-border bg-surface grid gap-4 rounded-xl border p-5">
         <h2 className="text-fg font-medium">Job details</h2>
@@ -141,6 +178,52 @@ export function JobDetailPanel({ job }: Props) {
         <p className="text-fg-muted text-sm whitespace-pre-wrap">{job.description}</p>
       </div>
 
+      <div className="border-border bg-surface grid gap-4 rounded-xl border p-5">
+        <h2 className="text-fg font-medium">Benefits &amp; Perks</h2>
+        <dl className="grid grid-cols-2 gap-x-8 gap-y-3">
+          <KV
+            label="Medical coverage"
+            value={
+              MEDICAL_COVERAGE_LABELS[
+                job.medicalCoverage as keyof typeof MEDICAL_COVERAGE_LABELS
+              ] ?? job.medicalCoverage
+            }
+          />
+          <KV
+            label="Bonus"
+            value={
+              BONUS_TIER_LABELS[job.bonusTier as keyof typeof BONUS_TIER_LABELS] ?? job.bonusTier
+            }
+          />
+          {job.annualLeaveDays != null && (
+            <KV label="Annual leave" value={`${job.annualLeaveDays} days / year`} />
+          )}
+        </dl>
+        {(() => {
+          const active = [
+            job.fuelAllowance && 'Fuel allowance',
+            job.flexibleHours && 'Flexible hours',
+            job.workFromHome && 'Work from home',
+            job.providentFund && 'Provident fund',
+            job.transportAllowance && 'Transport allowance',
+            job.eobi && 'EOBI',
+            job.lifeInsurance && 'Life insurance',
+          ].filter(Boolean) as string[];
+          return active.length > 0 ? (
+            <div className="flex flex-wrap gap-2 pt-1">
+              {active.map((perk) => (
+                <span
+                  key={perk}
+                  className="bg-surface-muted border-border text-fg-subtle rounded-full border px-3 py-1 text-xs"
+                >
+                  {perk}
+                </span>
+              ))}
+            </div>
+          ) : null;
+        })()}
+      </div>
+
       {transitions.length > 0 && (
         <div className="border-border bg-surface rounded-xl border p-5">
           <h2 className="text-fg mb-3 font-medium">Actions</h2>
@@ -155,6 +238,26 @@ export function JobDetailPanel({ job }: Props) {
       )}
 
       {error && <p className="text-danger text-sm">{error}</p>}
+
+      <Modal
+        open={showDeleteConfirm}
+        onOpenChange={setShowDeleteConfirm}
+        title="Delete this draft job?"
+      >
+        <div className="grid gap-4">
+          <p className="text-fg-muted text-sm">
+            “{job.title}” will be permanently deleted. This cannot be undone.
+          </p>
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="secondary" onClick={() => setShowDeleteConfirm(false)}>
+              Cancel
+            </Button>
+            <Button disabled={pending} onClick={handleDelete} variant="danger">
+              {pending ? 'Deleting…' : 'Delete job'}
+            </Button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

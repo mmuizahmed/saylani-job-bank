@@ -7,12 +7,12 @@ import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
 import { recordAudit, runCommand, type RequestContext } from '@/domains/shared/audit';
 import { DomainError } from '@/domains/shared/errors';
 import { maskEmail } from '@/domains/shared/masking';
-import { enforceRateLimit } from '@/domains/shared/rate-limit';
+import { enforceRateLimit, enforceRateLimitByIp } from '@/domains/shared/rate-limit';
 import { db, type DbExecutor } from '@/lib/db';
 import { env } from '@/lib/env';
 import { sendMail } from '@/lib/mail/mailer';
 import { invitationEmail, passwordResetEmail } from '@/lib/mail/templates';
-import { loginWithPassword, type SignInResult } from './service';
+import { loginWithPassword, clearTrustedDevices, type SignInResult } from './service';
 
 export const INVITE_TTL_DAYS = 7;
 export const RESET_TTL_MINUTES = 60;
@@ -25,7 +25,22 @@ export class InvalidLinkError extends DomainError {
   }
 }
 
-const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
+export const hashAccountToken = (token: string) => createHash('sha256').update(token).digest('hex');
+
+/** Marks all still-unused tokens of one purpose void; returns how many were voided. */
+export async function voidAccountTokens(
+  executor: DbExecutor,
+  userId: string,
+  purpose: schema.AccountTokenPurpose,
+): Promise<number> {
+  const t = schema.accountTokens;
+  const rows = await executor
+    .update(t)
+    .set({ usedAt: sql`now()` })
+    .where(and(eq(t.userId, userId), eq(t.purpose, purpose), isNull(t.usedAt)))
+    .returning({ id: t.id });
+  return rows.length;
+}
 
 /** Issues a fresh single-use token; older unused tokens of the same purpose stop working. */
 export async function issueAccountToken(
@@ -39,14 +54,11 @@ export async function issueAccountToken(
 ): Promise<string> {
   const token = randomBytes(32).toString('base64url');
   const t = schema.accountTokens;
-  await executor
-    .update(t)
-    .set({ usedAt: sql`now()` })
-    .where(and(eq(t.userId, input.userId), eq(t.purpose, input.purpose), isNull(t.usedAt)));
+  await voidAccountTokens(executor, input.userId, input.purpose);
   await executor.insert(t).values({
     userId: input.userId,
     purpose: input.purpose,
-    tokenHash: hashToken(token),
+    tokenHash: hashAccountToken(token),
     expiresAt: new Date(Date.now() + input.ttlSeconds * 1000),
     createdBy: input.createdBy,
   });
@@ -65,7 +77,7 @@ async function findValidToken(
     .from(t)
     .where(
       and(
-        eq(t.tokenHash, hashToken(token)),
+        eq(t.tokenHash, hashAccountToken(token)),
         eq(t.purpose, purpose),
         isNull(t.usedAt),
         gt(t.expiresAt, sql`now()`),
@@ -102,6 +114,11 @@ export async function setCredentialPassword(
 
 const appUrl = (path: string) => new URL(path, env.NEXT_PUBLIC_APP_URL).toString();
 
+/** The set-password link for an invite token. Same URL the email carries, so an
+ * admin who copies it from the dashboard hands out the identical link. */
+export const invitationUrl = (token: string) =>
+  appUrl(`/accept-invite?token=${token}`);
+
 // ─── Invitations ───────────────────────────────────────────────────────
 
 /** Emails an invitation link. Called after the user + role rows are committed. */
@@ -112,7 +129,7 @@ export async function sendInvitationEmail(input: {
   role: Role;
   branchName: string | null;
 }): Promise<void> {
-  const url = appUrl(`/accept-invite?token=${encodeURIComponent(input.token)}`);
+  const url = invitationUrl(input.token);
   await sendMail({
     to: input.user.email,
     ...invitationEmail({
@@ -157,7 +174,16 @@ export async function acceptInvitation(
   password: string,
   requestHeaders: Headers,
 ): Promise<SignInResult | Awaited<ReturnType<typeof loginWithPassword>>> {
-  if (ctx.ip) await enforceRateLimit('invite-accept-ip', ctx.ip, { limit: 20, windowSeconds: 900 });
+  // Audit 2026-11-11 (M-17 + L-14): IP limit via the helper (a null IP
+  // lands in the shared 'untrusted' bucket instead of skipping), plus the
+  // same per-token 10/15m limit the invite lookup uses — keyed on the
+  // token's SHA-256 hash, never the raw token.
+  await enforceRateLimitByIp(ctx.ip, 'invite-accept-ip', { limit: 20, windowSeconds: 900 });
+  await enforceRateLimit(
+    'invite-accept-token',
+    createHash('sha256').update(token).digest('hex'),
+    { limit: 10, windowSeconds: 900 },
+  );
 
   const email = await runCommand(ctx, async ({ tx, audit }) => {
     const found = await findValidToken(tx, token, 'INVITE');
@@ -196,8 +222,8 @@ export async function requestPasswordReset(ctx: RequestContext, rawEmail: string
     { limit: 3, windowSeconds: 3600 },
     'Too many reset requests. Try again in an hour.',
   );
-  if (ctx.ip)
-    await enforceRateLimit('password-reset-ip', ctx.ip, { limit: 20, windowSeconds: 3600 });
+  // Audit 2026-11-11 (M-17): null IP lands in the 'untrusted' bucket.
+  await enforceRateLimitByIp(ctx.ip, 'password-reset-ip', { limit: 20, windowSeconds: 3600 });
 
   const [user] = await db
     .select()
@@ -243,8 +269,20 @@ export async function resetPassword(
   token: string,
   password: string,
 ): Promise<void> {
-  if (ctx.ip)
-    await enforceRateLimit('password-reset-confirm-ip', ctx.ip, { limit: 20, windowSeconds: 900 });
+  // Audit 2026-11-11 (M-17 + L-14): IP limit via the helper, plus the
+  // per-token 10/15m limit (same pattern as invite-accept above).
+  await enforceRateLimitByIp(ctx.ip, 'password-reset-confirm-ip', {
+    limit: 20,
+    windowSeconds: 900,
+  });
+  await enforceRateLimit(
+    'password-reset-token',
+    createHash('sha256').update(token).digest('hex'),
+    { limit: 10, windowSeconds: 900 },
+  );
+  // clearTrustedDevices uses the global db handle, so it runs after the
+  // transaction below (sessions are revoked inside it).
+  let userId: string | undefined;
   await runCommand(ctx, async ({ tx, audit }) => {
     const found = await findValidToken(tx, token, 'PASSWORD_RESET');
     if (!found) throw new InvalidLinkError();
@@ -255,14 +293,18 @@ export async function resetPassword(
     await setCredentialPassword(tx, user.id, password);
     await tx.delete(schema.sessions).where(eq(schema.sessions.userId, user.id));
     audit({ action: 'auth.password_reset', entityType: 'user', entityId: user.id });
+    userId = user.id;
   });
+  if (userId) await clearTrustedDevices(userId);
 }
 
 /** The newest unused, unexpired invitation for a user (shown on the user detail page). */
-export async function pendingInvitation(userId: string): Promise<{ expiresAt: Date } | null> {
+export async function pendingInvitation(
+  userId: string,
+): Promise<{ expiresAt: Date; createdAt: Date } | null> {
   const t = schema.accountTokens;
   const [row] = await db
-    .select({ expiresAt: t.expiresAt })
+    .select({ expiresAt: t.expiresAt, createdAt: t.createdAt })
     .from(t)
     .where(
       and(

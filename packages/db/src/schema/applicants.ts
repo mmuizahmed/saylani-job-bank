@@ -1,12 +1,13 @@
 import {
   APPLICANT_DOCUMENT_STATUSES,
+  APPLICANT_REGISTRATION_SOURCES,
   APPLICANT_STATUSES,
+  APPLICANT_TOKEN_STATUSES,
   GENDERS,
   IDENTITY_METHODS,
   IDENTITY_OUTCOMES,
   IDENTITY_STATUSES,
   LANGUAGE_PROFICIENCIES,
-  RADIUS_LIMITS,
   SKILL_LEVELS,
 } from '@jobbank/shared';
 import { sql } from 'drizzle-orm';
@@ -21,6 +22,7 @@ import {
   smallint,
   text,
   timestamp,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
 import { geographyPoint } from '../types/geography';
@@ -48,6 +50,14 @@ export const applicants = pgTable(
       .unique()
       .references(() => users.id, { onDelete: 'restrict' }),
     branchId: uuid().references(() => branches.id, { onDelete: 'restrict' }),
+    registrationSource: text({ enum: APPLICANT_REGISTRATION_SOURCES })
+      .notNull()
+      .default('SELF_SERVICE'),
+    registrationReference: text().notNull().unique(),
+    registeredBy: uuid().references(() => users.id, { onDelete: 'set null' }),
+    registeredAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+    contactConfirmedBy: uuid().references(() => users.id, { onDelete: 'set null' }),
+    contactConfirmedAt: timestamp({ withTimezone: true }),
     fullName: text().notNull(),
     fatherName: text().notNull(),
     /** 13 digits, no dashes. Never sent to employers (PRD rule 3). */
@@ -56,9 +66,23 @@ export const applicants = pgTable(
     gender: text({ enum: GENDERS }).notNull(),
     /** Optional contact email (the `users` row only has a placeholder). */
     email: text(),
-    status: text({ enum: APPLICANT_STATUSES }).notNull().default('DRAFT'),
+    /** The staff member who registered this candidate at a counter; null for self sign-up. */
+    counterRegisteredBy: uuid().references(() => users.id, { onDelete: 'set null' }),
+    /**
+     * When staff recorded the candidate's agreement. Set only from the signed
+     * paper consent form kept at the branch (counter registration); never
+     * defaulted — a missing value means no consent evidence is on file.
+     */
+    consentConfirmedAt: timestamp({ withTimezone: true }),
+    status: text({ enum: APPLICANT_STATUSES }).notNull().default('ACTIVE'),
     /** Why staff deactivated the profile (shown to staff). */
     statusReason: text(),
+    /** When the first-counter paper form was verified and signed (null until then). */
+    registrationVerifiedSignedAt: timestamp({ withTimezone: true }),
+    /** Who recorded the verified & signed mark. */
+    registrationVerifiedSignedBy: uuid().references(() => users.id, { onDelete: 'set null' }),
+    /** Free-text notes from section 6 of the first-counter form. */
+    additionalNotes: text(),
     /** Current result of the staff identity check; history is in identity_verifications. */
     identityStatus: text({ enum: IDENTITY_STATUSES }).notNull().default('UNVERIFIED'),
     profileCompleteness: smallint().notNull().default(0),
@@ -68,6 +92,10 @@ export const applicants = pgTable(
   },
   (t) => [
     index('applicants_branch_status_idx').on(t.branchId, t.status),
+    // Trigram index for the staff `ILIKE '%q%'` name search (profile.ts/staff.ts).
+    // GIN has no default opclass for text — `gin_trgm_ops` must be named
+    // explicitly or CREATE INDEX fails with 42704 (migration 0027).
+    index('applicants_full_name_trgm_idx').using('gin', sql`${t.fullName} gin_trgm_ops`),
     check('applicants_cnic_format', sql`${t.cnic} ~ '^[1-9][0-9]{12}$'`),
     check('applicants_status_valid', sql`${t.status} in (${list(APPLICANT_STATUSES)})`),
     check(
@@ -75,15 +103,18 @@ export const applicants = pgTable(
       sql`${t.identityStatus} in (${list(IDENTITY_STATUSES)})`,
     ),
     check('applicants_gender_valid', sql`${t.gender} in (${list(GENDERS)})`),
-    check('applicants_completeness_range', sql`${t.profileCompleteness} between 0 and 100`),
     check(
-      'applicants_active_needs_branch',
-      sql`${t.status} = 'DRAFT' or ${t.branchId} is not null`,
+      'applicants_registration_source_valid',
+      sql`${t.registrationSource} in (${list(APPLICANT_REGISTRATION_SOURCES)})`,
     ),
+    check('applicants_completeness_range', sql`${t.profileCompleteness} between 0 and 100`),
+    // No branch check: a fresh self-registration has no branch until the
+    // location step assigns one (the old applicants_active_needs_branch
+    // check only ever exempted DRAFT profiles, and DRAFT is gone).
   ],
 );
 
-/** The applicant's current home pin (one per applicant; changes are kept in the audit log). */
+/** The applicant's current home address (one per applicant; changes are kept in the audit log). The map pin is optional since 2026-11-16: the staff registration form no longer collects a home location, so new registrations have no pin. */
 export const applicantAddresses = pgTable('applicant_addresses', {
   applicantId: uuid()
     .primaryKey()
@@ -91,7 +122,22 @@ export const applicantAddresses = pgTable('applicant_addresses', {
   addressLine: text().notNull(),
   cityCode: text().notNull(),
   areaCode: text(),
-  location: geographyPoint().notNull(),
+  location: geographyPoint(),
+  ...timestamps,
+});
+
+/**
+ * The applicant's permanent home address (one per applicant), mirroring
+ * `applicant_addresses`. No map pin is collected for it, so `location` is optional.
+ */
+export const applicantPermanentAddresses = pgTable('applicant_permanent_addresses', {
+  applicantId: uuid()
+    .primaryKey()
+    .references(() => applicants.id, { onDelete: 'cascade' }),
+  addressLine: text().notNull(),
+  cityCode: text().notNull(),
+  areaCode: text(),
+  location: geographyPoint(),
   ...timestamps,
 });
 
@@ -214,17 +260,11 @@ export const applicantPreferences = pgTable(
       .array()
       .notNull()
       .default(sql`'{}'::text[]`),
-    /** null = as far as the matching radius policy allows. Never above 10 km. */
-    willingRadiusM: integer(),
     availableFrom: date({ mode: 'string' }),
     ...timestamps,
   },
   (t) => [
     check('applicant_preferences_salary', sql`${t.minSalaryPkr} is null or ${t.minSalaryPkr} >= 0`),
-    check(
-      'applicant_preferences_radius',
-      sql`${t.willingRadiusM} is null or ${t.willingRadiusM} between ${sql.raw(String(RADIUS_LIMITS.minM))} and ${sql.raw(String(RADIUS_LIMITS.maxM))}`,
-    ),
   ],
 );
 
@@ -296,6 +336,109 @@ export const identityVerifications = pgTable(
     check(
       'identity_verifications_outcome_valid',
       sql`${t.outcome} in (${list(IDENTITY_OUTCOMES)})`,
+    ),
+  ],
+);
+
+/**
+ * First-counter token (2026-11-07 reversal): one row per token issued at a
+ * branch. The token number is a daily sequence per branch (1, 2, 3, … from
+ * `registration_day`, Pakistan calendar day); the unique index is the guard
+ * against two counters issuing the same number. `applicant_id` stays null
+ * until the later full-registration step links the completed profile.
+ */
+export const branchApplicantTokens = pgTable(
+  'branch_applicant_tokens',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    branchId: uuid()
+      .notNull()
+      .references(() => branches.id, { onDelete: 'restrict' }),
+    /** Pakistan calendar day the token was issued (token numbers reset daily). */
+    registrationDay: date({ mode: 'string' }).notNull(),
+    tokenNumber: integer().notNull(),
+    /** 13 digits, no dashes. */
+    cnic: text().notNull(),
+    applicantName: text().notNull(),
+    /** E.164 mobile, e.g. +923001234567. No format CHECK: rows issued before
+        this column existed carry '' — validation lives in the shared schema. */
+    phone: text().notNull().default(''),
+    status: text({ enum: APPLICANT_TOKEN_STATUSES }).notNull().default('ISSUED'),
+    /** Linked once the full registration is completed for this token. */
+    applicantId: uuid().references(() => applicants.id, { onDelete: 'set null' }),
+    /**
+     * Applicant ID reserved at issue (8-character registration reference).
+     * Null on tokens issued before this column existed. Copied onto
+     * `applicants.registration_reference` when the token is registered, and
+     * reused on later tokens for the same CNIC until one is registered.
+     */
+    registrationReference: text(),
+    issuedBy: uuid().references(() => users.id, { onDelete: 'set null' }),
+    issuedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+    /**
+     * End of the issue day in Pakistan time (migration 0035). Derived from the
+     * same instant as `issuedAt` so a midnight rollover can never split the
+     * two (N3). An ISSUED token past this instant is expired: it no longer
+     * completes and never blocks a new token (dedup is per-day anyway).
+     */
+    expiresAt: timestamp({ withTimezone: true }).notNull(),
+    ...timestamps,
+  },
+  (t) => [
+    index('branch_applicant_tokens_branch_day_idx').on(t.branchId, t.registrationDay),
+    // Daily sequence guard: two counters can never issue the same number.
+    uniqueIndex('branch_applicant_tokens_branch_day_number_unique').on(
+      t.branchId,
+      t.registrationDay,
+      t.tokenNumber,
+    ),
+    // Same-CNIC same-day guard (H22, migration 0031): two counters can never
+    // issue different tokens for the same person on the same day. Matches the
+    // migration SQL exactly so `db:generate` emits no diff.
+    uniqueIndex('branch_applicant_tokens_branch_day_cnic_issued_unique')
+      .on(t.branchId, t.registrationDay, t.cnic)
+      .where(sql`"status" = 'ISSUED'`),
+    index('branch_applicant_tokens_cnic_idx').on(t.cnic),
+    index('branch_applicant_tokens_registration_reference_idx')
+      .on(t.registrationReference)
+      .where(sql`"registration_reference" is not null`),
+    check('branch_applicant_tokens_number_positive', sql`${t.tokenNumber} > 0`),
+    // N6 cap (MAX_TOKEN_NUMBER in @jobbank/shared): no 5-digit token numbers.
+    check('branch_applicant_tokens_number_max', sql`${t.tokenNumber} <= 9999`),
+    check('branch_applicant_tokens_expires_after_issued', sql`${t.expiresAt} > ${t.issuedAt}`),
+    check('branch_applicant_tokens_cnic_format', sql`${t.cnic} ~ '^[1-9][0-9]{12}$'`),
+    check(
+      'branch_applicant_tokens_status_valid',
+      sql`${t.status} in (${list(APPLICANT_TOKEN_STATUSES)})`,
+    ),
+  ],
+);
+
+/** QR verification credentials are hash-indexed; ciphertext is only for authorized reprints. */
+export const applicantVerificationTokens = pgTable(
+  'applicant_verification_tokens',
+  {
+    id: uuid().primaryKey().defaultRandom(),
+    applicantId: uuid()
+      .notNull()
+      .references(() => applicants.id, { onDelete: 'cascade' }),
+    tokenHash: text().notNull().unique(),
+    tokenCiphertext: text().notNull(),
+    isActive: boolean().notNull().default(true),
+    createdAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+    createdBy: uuid().references(() => users.id, { onDelete: 'set null' }),
+    revokedAt: timestamp({ withTimezone: true }),
+    revokedBy: uuid().references(() => users.id, { onDelete: 'set null' }),
+  },
+  (t) => [
+    uniqueIndex('applicant_verification_tokens_active_applicant_idx')
+      .on(t.applicantId)
+      .where(sql`${t.isActive}`),
+    index('applicant_verification_tokens_applicant_idx').on(t.applicantId, t.createdAt),
+    check(
+      'applicant_verification_tokens_revocation_consistent',
+      sql`(${t.isActive} and ${t.revokedAt} is null and ${t.revokedBy} is null)
+       or (not ${t.isActive} and ${t.revokedAt} is not null)`,
     ),
   ],
 );

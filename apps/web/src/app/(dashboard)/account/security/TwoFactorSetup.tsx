@@ -1,12 +1,12 @@
 'use client';
 
-import { Copy, Download } from 'lucide-react';
+import { Copy, Download, Eye, EyeOff } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useState, type FormEvent } from 'react';
 import { Button, Input } from '@/components/atoms';
 import { FormField, OTPInput, toast } from '@/components/molecules';
 import { Stepper } from '@/components/organisms';
-import { ApiClientError, apiFetch } from '@/lib/api/client';
+import { apiFetch, friendlyApiError } from '@/lib/api/client';
 
 interface Enrollment {
   qrSvg: string;
@@ -20,10 +20,22 @@ const steps = [
   { id: 'verify', label: 'Enter code' },
 ];
 
-export function TwoFactorSetup({ required }: { required: boolean }) {
+export function TwoFactorSetup({
+  required,
+  setupToken,
+}: {
+  required: boolean;
+  /**
+   * Audit H-02: when the caller has no session (2FA-required role, never
+   * enrolled), login issued this short-lived token instead. It is sent with
+   * the password so enrolment can buy exactly the pending session it needs.
+   */
+  setupToken?: string;
+}) {
   const router = useRouter();
   const [step, setStep] = useState(0);
   const [password, setPassword] = useState('');
+  const [showPw, setShowPw] = useState(false);
   const [enrollment, setEnrollment] = useState<Enrollment | null>(null);
   const [savedCodes, setSavedCodes] = useState(false);
   const [code, setCode] = useState('');
@@ -37,13 +49,13 @@ export function TwoFactorSetup({ required }: { required: boolean }) {
     try {
       const { data } = await apiFetch<Enrollment>('/api/v1/account/2fa/enroll', {
         method: 'POST',
-        body: { password },
+        body: setupToken ? { password, setupToken } : { password },
       });
       setEnrollment(data);
       setPassword('');
       setStep(1);
     } catch (err) {
-      setError(err instanceof ApiClientError ? err.message : 'Could not start setup');
+      setError(friendlyApiError(err));
     } finally {
       setPending(false);
     }
@@ -62,7 +74,7 @@ export function TwoFactorSetup({ required }: { required: boolean }) {
       }
       router.refresh();
     } catch (err) {
-      setError(err instanceof ApiClientError ? err.message : 'Could not verify the code');
+      setError(friendlyApiError(err));
       setCode('');
       setPending(false);
     }
@@ -82,10 +94,20 @@ export function TwoFactorSetup({ required }: { required: boolean }) {
         <form className="grid gap-4" onSubmit={start}>
           <FormField label="Your password" required error={error ?? undefined}>
             <Input
-              type="password"
+              type={showPw ? 'text' : 'password'}
               autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              endAdornment={
+                <button
+                  type="button"
+                  aria-label={showPw ? 'Hide password' : 'Show password'}
+                  onClick={() => setShowPw((v) => !v)}
+                  className="text-fg-muted"
+                >
+                  {showPw ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                </button>
+              }
             />
           </FormField>
           <Button
@@ -174,6 +196,8 @@ export function TwoFactorSetup({ required }: { required: boolean }) {
             <label className="text-fg flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
+                id="two-factor-saved-codes"
+                name="two-factor-saved-codes"
                 checked={savedCodes}
                 onChange={(e) => setSavedCodes(e.target.checked)}
                 className="size-4 accent-[var(--primary)]"

@@ -1,11 +1,11 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { Bell, Check, MailCheck, X } from 'lucide-react';
 import type { PendingOffer } from '@/domains/matching';
 import type { NotificationView } from '@/domains/notifications';
-import { apiFetch } from '@/lib/api/client';
+import { apiFetch, friendlyApiError } from '@/lib/api/client';
 import { formatDate } from '@/lib/format/date';
 import { Badge, Button, Label, Select, StatusPill, Textarea } from '@/components/atoms';
 import { EmptyState, Modal, toast } from '@/components/molecules';
@@ -25,6 +25,29 @@ interface Props {
 
 export function NotificationsClient({ items, unread, offers, refusalReasons }: Props) {
   const router = useRouter();
+  const lastCreatedAt = items[0]?.createdAt?.toISOString?.() ?? new Date().toISOString();
+  const sinceRef = useRef(lastCreatedAt);
+
+  // ── SSE: real-time notification push ───────────────────────────────────
+  useEffect(() => {
+    const url = `/api/v1/notifications/stream?since=${encodeURIComponent(sinceRef.current)}`;
+    const es = new EventSource(url);
+
+    es.addEventListener('notifications', () => {
+      // New notifications arrived — refresh the server-rendered page data.
+      router.refresh();
+    });
+
+    es.onerror = () => {
+      // EventSource reconnects automatically; nothing to do here.
+    };
+
+    return () => {
+      es.close();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const [busyId, setBusyId] = useState<string | null>(null);
   const [declining, setDeclining] = useState<PendingOffer | null>(null);
   const [accepting, setAccepting] = useState<PendingOffer | null>(null);
@@ -48,7 +71,7 @@ export function NotificationsClient({ items, unread, offers, refusalReasons }: P
       toast.success('All updates marked as read.');
       router.refresh();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Could not mark updates as read.');
+      toast.error(friendlyApiError(e));
     } finally {
       setBusyId(null);
     }
@@ -77,7 +100,7 @@ export function NotificationsClient({ items, unread, offers, refusalReasons }: P
       setModalError(null);
       router.refresh();
     } catch (e) {
-      const message = e instanceof Error ? e.message : 'Could not send your answer.';
+      const message = friendlyApiError(e);
       setModalError(message);
       toast.error(message);
     } finally {
@@ -217,6 +240,39 @@ export function NotificationsClient({ items, unread, offers, refusalReasons }: P
                             MATCH_SHORTLISTED: { label: 'Shortlisted', tone: 'info' as const },
                             OFFER_ACCEPTED: { label: 'Accepted', tone: 'success' as const },
                             OFFER_DECLINED: { label: 'Declined', tone: 'warning' as const },
+                            INTERVIEW_POSTPONED: { label: 'Postponed', tone: 'warning' as const },
+                            INTERVIEW_CANCELLED: { label: 'Cancelled', tone: 'neutral' as const },
+                            INTERVIEW_RESCHEDULED: { label: 'Rescheduled', tone: 'info' as const },
+                            INTERVIEW_PASSED: { label: 'Passed', tone: 'success' as const },
+                            INTERVIEW_FAILED: { label: 'Not passed', tone: 'danger' as const },
+                            EMPLOYER_INTERVIEW_SCHEDULED: {
+                              label: 'Employer interview',
+                              tone: 'info' as const,
+                            },
+                            EMPLOYER_INTERVIEW_POSTPONED: {
+                              label: 'Employer postponed',
+                              tone: 'warning' as const,
+                            },
+                            EMPLOYER_INTERVIEW_RESCHEDULED: {
+                              label: 'Employer rescheduled',
+                              tone: 'info' as const,
+                            },
+                            EMPLOYER_INTERVIEW_CANCELLED: {
+                              label: 'Employer cancelled',
+                              tone: 'neutral' as const,
+                            },
+                            APPLICANT_REFERRED: { label: 'Referred', tone: 'success' as const },
+                            JOB_REFERRED_TO_APPLICANT: {
+                              label: 'Job referred',
+                              tone: 'info' as const,
+                            },
+                            COMPANY_SUSPENDED: { label: 'Suspended', tone: 'danger' as const },
+                            COMPANY_REINSTATED: { label: 'Reinstated', tone: 'success' as const },
+                            VERIFIER_ASSIGNED: {
+                              label: 'Verifier assigned',
+                              tone: 'info' as const,
+                            },
+                            COMPANY_TRANSFERRED: { label: 'Moved', tone: 'info' as const },
                           }[item.type] ?? { label: item.type, tone: 'neutral' as const })}
                         />
                       </span>

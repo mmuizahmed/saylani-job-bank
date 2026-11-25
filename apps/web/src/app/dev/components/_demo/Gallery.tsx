@@ -26,7 +26,6 @@ import {
   CNICInput,
   ConfirmDialog,
   DateTimePicker,
-  DistanceBadge,
   EmptyState,
   FileUploader,
   FormField,
@@ -42,11 +41,9 @@ import {
 import {
   DataTable,
   KanbanBoard,
-  MapPinPicker,
   Stepper,
   Timeline,
   TopBar,
-  type LatLng,
   type SortState,
 } from '@/components/organisms';
 import { tones } from '@/design-system/tokens';
@@ -60,7 +57,6 @@ const sections = [
   ['forms', 'Form molecules'],
   ['feedback', 'Feedback & display'],
   ['data', 'Data organisms'],
-  ['map', 'Map pin picker'],
   ['navigation', 'Navigation'],
   ['templates', 'Templates'],
 ] as const;
@@ -89,9 +85,8 @@ export function Gallery() {
   const [otp, setOtp] = useState('');
   const [when, setWhen] = useState('');
   const [page, setPage] = useState(3);
-  const [sort, setSort] = useState<SortState | null>({ id: 'distance', direction: 'asc' });
+  const [sort, setSort] = useState<SortState | null>({ id: 'updated', direction: 'asc' });
   const [tableLoading, setTableLoading] = useState(false);
-  const [pin, setPin] = useState<LatLng | null>({ lat: 24.9056, lng: 67.0822 });
   const [step, setStep] = useState(1);
   const [notify, setNotify] = useState(true);
 
@@ -99,7 +94,6 @@ export function Gallery() {
     if (!sort) return demoCandidates;
     const factor = sort.direction === 'asc' ? 1 : -1;
     return [...demoCandidates].sort((a, b) => {
-      if (sort.id === 'distance') return (a.distanceM - b.distanceM) * factor;
       if (sort.id === 'updated') return a.updatedAt.localeCompare(b.updatedAt) * factor;
       return a.code.localeCompare(b.code) * factor;
     });
@@ -410,18 +404,6 @@ export function Gallery() {
                   trigger={<Button variant="danger">Withdraw…</Button>}
                 />
               </Demo>
-              <Demo
-                title="DistanceBadge — exact (staff) vs masked (employer)"
-                className="grid gap-3"
-              >
-                {[3_400, 7_900, 9_500, 10_400].map((meters) => (
-                  <div key={meters} className="flex items-center gap-3">
-                    <DistanceBadge meters={meters} />
-                    <span className="text-fg-subtle text-xs">→ employer sees</span>
-                    <DistanceBadge meters={meters} masked />
-                  </div>
-                ))}
-              </Demo>
               <Demo title="KeyValue">
                 <KeyValue
                   items={[
@@ -525,12 +507,6 @@ export function Gallery() {
                   },
                   { id: 'trade', header: 'Trade', hideBelow: 'md', cell: (row) => row.trade },
                   { id: 'area', header: 'Area', hideBelow: 'lg', cell: (row) => row.area },
-                  {
-                    id: 'distance',
-                    header: 'Distance',
-                    sortable: true,
-                    cell: (row) => <DistanceBadge meters={row.distanceM} />,
-                  },
                   { id: 'status', header: 'Status', cell: (row) => <StatusPill {...row.status} /> },
                   {
                     id: 'updated',
@@ -564,7 +540,7 @@ export function Gallery() {
                 empty={
                   <EmptyState
                     compact
-                    title="No matches within 10 km"
+                    title="No matches yet"
                     description="Try again after new applicants register."
                   />
                 }
@@ -577,10 +553,7 @@ export function Gallery() {
                 onCardClick={(item) => toast(`Open ${item.code}`)}
                 renderCard={(item) => (
                   <div className="grid gap-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-fg text-sm font-medium">{item.name}</span>
-                      <DistanceBadge meters={item.distanceM} />
-                    </div>
+                    <span className="text-fg text-sm font-medium">{item.name}</span>
                     <span className="text-fg-muted text-xs">
                       {item.trade} · {item.area}
                     </span>
@@ -691,26 +664,6 @@ export function Gallery() {
                 onPageChange={setPage}
                 pageSize={20}
                 total={312}
-              />
-            </Demo>
-          </Section>
-
-          {/* ── Map ─────────────────────────────────────── */}
-          <Section
-            id="map"
-            title="Map pin picker"
-            description="Tap to place, drag to adjust, use GPS, or type coordinates. Rings show the 8 km preferred / 10 km maximum radius."
-          >
-            <Demo title="Editable with radius rings">
-              <MapPinPicker
-                value={pin}
-                onChange={setPin}
-                label="Job site"
-                zoom={11}
-                rings={[
-                  { meters: 8_000, tone: 'success', label: '8 km preferred' },
-                  { meters: 10_000, tone: 'warning', label: '10 km maximum' },
-                ]}
               />
             </Demo>
           </Section>

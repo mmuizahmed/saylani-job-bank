@@ -1,15 +1,17 @@
 'use client';
 
+import { Eye, EyeOff } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import { Button, Input } from '@/components/atoms';
 import { FormField, toast } from '@/components/molecules';
-import { ApiClientError, apiFetch } from '@/lib/api/client';
+import { apiFetch, friendlyApiError } from '@/lib/api/client';
 
 export function TwoFactorStatus({ canDisable }: { canDisable: boolean }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [password, setPassword] = useState('');
+  const [showPw, setShowPw] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -40,17 +42,27 @@ export function TwoFactorStatus({ canDisable }: { canDisable: boolean }) {
                 toast.success('Two-factor authentication is off');
                 router.refresh();
               } catch (err) {
-                setError(err instanceof ApiClientError ? err.message : 'Could not turn it off');
+                setError(friendlyApiError(err));
                 setPending(false);
               }
             }}
           >
             <FormField label="Confirm your password" required error={error ?? undefined}>
               <Input
-                type="password"
+                type={showPw ? 'text' : 'password'}
                 autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
+                endAdornment={
+                  <button
+                    type="button"
+                    aria-label={showPw ? 'Hide password' : 'Show password'}
+                    onClick={() => setShowPw((v) => !v)}
+                    className="text-fg-muted"
+                  >
+                    {showPw ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                  </button>
+                }
               />
             </FormField>
             <div className="flex gap-2">

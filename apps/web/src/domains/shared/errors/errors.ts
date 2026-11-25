@@ -1,4 +1,6 @@
-import type { ErrorCode, FieldIssue } from '@jobbank/shared';
+import { fieldLabel, messageNamesField, type ErrorCode, type FieldIssue } from '@jobbank/shared';
+
+export { fieldLabel };
 
 /**
  * Base class for expected, user-facing failures. Anything that is NOT a DomainError
@@ -19,15 +21,33 @@ export class DomainError extends Error {
 }
 
 export class BadRequestError extends DomainError {
-  constructor(message = 'Bad request', details?: unknown) {
+  constructor(
+    message = 'The request could not be understood — check the data you sent and try again.',
+    details?: unknown,
+  ) {
     super('BAD_REQUEST', 400, message, details);
   }
 }
 
+/**
+ * Top-level message for a validation failure. Every issue is named, not
+ * only the first, so a person sees each field and the reason it failed.
+ * A message that already starts with the field label is not prefixed again.
+ */
+export function validationMessage(issues: FieldIssue[]): string {
+  if (issues.length === 0) return 'Some fields are invalid';
+  const parts = issues.map((issue) => {
+    if (issue.path === '(root)' || issue.path === 'root' || issue.path === '') return issue.message;
+    if (messageNamesField(issue.path, issue.message)) return issue.message;
+    return `${fieldLabel(issue.path)}: ${issue.message}`;
+  });
+  return [...new Set(parts)].join('; ');
+}
+
 export class ValidationError extends DomainError {
   readonly issues: FieldIssue[];
-  constructor(issues: FieldIssue[], message = 'Some fields are invalid') {
-    super('VALIDATION_FAILED', 422, message);
+  constructor(issues: FieldIssue[], message?: string) {
+    super('VALIDATION_FAILED', 422, message ?? validationMessage(issues));
     this.issues = issues;
   }
 }
@@ -101,6 +121,21 @@ export function isUniqueViolation(error: unknown, constraint?: string): boolean 
   for (let current: unknown = error, depth = 0; current && depth < 5; depth++) {
     const pg = current as { code?: unknown; constraint_name?: unknown; cause?: unknown };
     if (pg.code === '23505') return constraint === undefined || pg.constraint_name === constraint;
+    current = pg.cause;
+  }
+  return false;
+}
+
+/**
+ * True when `error` (or a wrapped cause) is a Postgres check-constraint
+ * violation — optionally on one named constraint. Use it to turn a DB
+ * backstop (e.g. a race between a pre-check and the write) into a
+ * ValidationError on the offending field instead of an unhandled 500.
+ */
+export function isCheckViolation(error: unknown, constraint?: string): boolean {
+  for (let current: unknown = error, depth = 0; current && depth < 5; depth++) {
+    const pg = current as { code?: unknown; constraint_name?: unknown; cause?: unknown };
+    if (pg.code === '23514') return constraint === undefined || pg.constraint_name === constraint;
     current = pg.cause;
   }
   return false;

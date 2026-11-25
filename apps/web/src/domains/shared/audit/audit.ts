@@ -1,6 +1,6 @@
 import { schema } from '@jobbank/db';
 import { db, type DbExecutor, type Transaction } from '@/lib/db';
-import { redactPii } from '@/lib/privacy/redact';
+import { redactPii, REDACTED } from '@/lib/privacy/redact';
 import {
   dispatchEvents,
   type DomainEvent,
@@ -25,20 +25,55 @@ export interface AuditEntry {
 
 function toRow(ctx: RequestContext, entry: AuditEntry): typeof schema.auditLogs.$inferInsert {
   return {
-    actorUserId: ctx.actor?.userId ?? null,
-    actorRole: ctx.system ? 'SYSTEM' : (ctx.actor?.roles.join(',') ?? 'ANONYMOUS'),
+    // When staff act on behalf of a candidate or a company, the audit row names
+    // the staff member (enteredBy), not the account acted for.
+    actorUserId: ctx.enteredBy?.userId ?? ctx.actor?.userId ?? null,
+    actorRole: ctx.system
+      ? 'SYSTEM'
+      : ((ctx.enteredBy ?? ctx.actor)?.roles.join(',') ?? 'ANONYMOUS'),
     branchId: entry.branchId ?? null,
     action: entry.action,
     entityType: entry.entityType,
     entityId: entry.entityId ?? null,
     before: entry.before === undefined ? null : redactPii(entry.before),
     after: entry.after === undefined ? null : redactPii(entry.after),
-    reason: entry.reason ?? null,
-    metadata: entry.metadata ? redactPii(entry.metadata) : null,
+    reason: redactAuditReason(entry.reason),
+    metadata:
+      entry.metadata || ctx.enteredBy
+        ? redactPii({
+            ...entry.metadata,
+            ...(ctx.enteredBy
+              ? ctx.actor?.companyId
+                ? { onBehalfOfCompanyId: ctx.actor.companyId }
+                : { onBehalfOfUserId: ctx.actor?.userId }
+              : {}),
+          })
+        : null,
     ip: ctx.ip,
     userAgent: ctx.userAgent?.slice(0, 512) ?? null,
     correlationId: ctx.correlationId,
   };
+}
+
+/**
+ * Patterns for PII pasted into free text. `redactPii` is key-based, so it cannot
+ * help here: an audit `reason` is a bare string with no keys to match (M14).
+ * A phone or CNIC pasted into a reason used to persist verbatim in audit_logs.
+ */
+const FREE_TEXT_PII: readonly RegExp[] = [
+  /\b\d{5}-\d{7}-\d\b/g, // CNIC with dashes: 42101-1234567-1
+  /(?<!\d)\d{13}(?!\d)/g, // CNIC, 13 plain digits
+  /\+?92[\s-]?3\d{2}[\s-]?\d{7}\b/g, // PK mobile, +92 / 92 form
+  /(?<!\d)03\d{2}[\s-]?\d{7}\b/g, // PK mobile, 03xx form
+  /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, // email address
+];
+
+/** Redacts PII pasted into a free-text audit reason; null/empty pass through. */
+export function redactAuditReason(reason: string | null | undefined): string | null {
+  if (!reason) return null;
+  let out = reason;
+  for (const pattern of FREE_TEXT_PII) out = out.replace(pattern, REDACTED);
+  return out;
 }
 
 /**

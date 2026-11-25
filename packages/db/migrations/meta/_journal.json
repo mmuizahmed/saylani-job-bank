@@ -1,125 +1,384 @@
 {
-    "version":  "7",
-    "dialect":  "postgresql",
-    "entries":  [
-                    {
-                        "idx":  0,
-                        "version":  "7",
-                        "when":  1790856878382,
-                        "tag":  "0000_bootstrap",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  1,
-                        "version":  "7",
-                        "when":  1790865306063,
-                        "tag":  "0001_system_tables",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  2,
-                        "version":  "7",
-                        "when":  1790865307256,
-                        "tag":  "0002_audit_append_only",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  3,
-                        "version":  "7",
-                        "when":  1790866483155,
-                        "tag":  "0003_identity_rbac_branches",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  4,
-                        "version":  "7",
-                        "when":  1790866500618,
-                        "tag":  "0004_identity_triggers",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  5,
-                        "version":  "7",
-                        "when":  1790869504475,
-                        "tag":  "0005_staff_2fa_tokens",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  6,
-                        "version":  "7",
-                        "when":  1790914071901,
-                        "tag":  "0006_master_data_settings",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  7,
-                        "version":  "7",
-                        "when":  1790914080512,
-                        "tag":  "0007_settings_triggers_radius_migration",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  8,
-                        "version":  "7",
-                        "when":  1790914094188,
-                        "tag":  "0008_drop_branch_service_radius",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  9,
-                        "version":  "7",
-                        "when":  1790934611134,
-                        "tag":  "0009_applicants",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  10,
-                        "version":  "7",
-                        "when":  1790934620434,
-                        "tag":  "0010_applicant_triggers",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  11,
-                        "version":  "7",
-                        "when":  1790939886242,
-                        "tag":  "0011_companies",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  12,
-                        "version":  "7",
-                        "when":  1790939894674,
-                        "tag":  "0012_company_triggers",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  13,
-                        "version":  "7",
-                        "when":  1791015643649,
-                        "tag":  "0013_jobs",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  14,
-                        "version":  "7",
-                        "when":  1791904855381,
-                        "tag":  "0014_matching",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  15,
-                        "version":  "7",
-                        "when":  1791906580972,
-                        "tag":  "0015_matching_perf",
-                        "breakpoints":  true
-                    },
-                    {
-                        "idx":  16,
-                        "version":  "7",
-                        "when":  1792015643000,
-                        "tag":  "0017_match_decisions",
-                        "breakpoints":  true
-                    }
-                ]
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1790856878382,
+      "tag": "0000_bootstrap",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790865306063,
+      "tag": "0001_system_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790865307256,
+      "tag": "0002_audit_append_only",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1790866483155,
+      "tag": "0003_identity_rbac_branches",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790866500618,
+      "tag": "0004_identity_triggers",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790869504475,
+      "tag": "0005_staff_2fa_tokens",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790914071901,
+      "tag": "0006_master_data_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790914080512,
+      "tag": "0007_settings_triggers_radius_migration",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1790914094188,
+      "tag": "0008_drop_branch_service_radius",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1790934611134,
+      "tag": "0009_applicants",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790934620434,
+      "tag": "0010_applicant_triggers",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1790939886242,
+      "tag": "0011_companies",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1790939894674,
+      "tag": "0012_company_triggers",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1791015643649,
+      "tag": "0013_jobs",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1791904855381,
+      "tag": "0014_matching",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1791906580972,
+      "tag": "0015_matching_perf",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1792015643000,
+      "tag": "0017_match_decisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1792100000000,
+      "tag": "0018_notifications",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1792100001000,
+      "tag": "0019_embeddings",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1792100001500,
+      "tag": "0014_job_benefits",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1792100001600,
+      "tag": "0015_applications",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1792100002000,
+      "tag": "0020_interview_statuses",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1792100003000,
+      "tag": "0021_employer_interview",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1792100004000,
+      "tag": "0022_applicant_category_documents",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1793894570078,
+      "tag": "0024_branch_registration_tokens",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1793941351604,
+      "tag": "0025_verified_signed_and_permanent_address",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1793983555966,
+      "tag": "0026_company_onboarding",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1793984793444,
+      "tag": "0027_pg_trgm_search_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1794064994032,
+      "tag": "0028_branch_applicant_tokens",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1794067791129,
+      "tag": "0029_branch_applicant_tokens_phone",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1794072801388,
+      "tag": "0030_job_referrals",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1794132997886,
+      "tag": "0031_branch_applicant_tokens_cnic_day_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1794136482225,
+      "tag": "0032_company_verifications_sla_remaining_days",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1794137897662,
+      "tag": "0033_job_applicant_referrals",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1794137955988,
+      "tag": "0034_drop_job_referrals",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1794140482656,
+      "tag": "0035_branch_applicant_tokens_expires_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1794141305000,
+      "tag": "0036_drop_applicant_preferences_willing_radius_m",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1794141306000,
+      "tag": "0037_job_matches_vacancy_filled",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1794236172766,
+      "tag": "0038_remove_applicant_draft_status",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1794246910933,
+      "tag": "0039_delete_retired_job_referred_notifications",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1794321236279,
+      "tag": "0040_company_cnic_front_back",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1794323296344,
+      "tag": "0041_job_posting_form_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1793895993475,
+      "tag": "0042_staff_assisted_applicants",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1793895995000,
+      "tag": "0043_applicant_registration_verification",
+      "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1794387358261,
+      "tag": "0044_counter_registration",
+      "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1794387358262,
+      "tag": "0045_employer_decisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "7",
+      "when": 1794500670217,
+      "tag": "0046_company_members_two_companies",
+      "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1794556784089,
+      "tag": "0047_company_ntn_optional",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1794558842685,
+      "tag": "0048_company_documents_optional",
+      "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "7",
+      "when": 1794846188839,
+      "tag": "0049_applicant_address_location_optional",
+      "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1795187000000,
+      "tag": "0050_branch_applicant_tokens_registration_reference",
+      "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "7",
+      "when": 1795268865596,
+      "tag": "0051_interviewer_scheduler_branch_scope",
+      "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "7",
+      "when": 1795275297092,
+      "tag": "0052_interview_outcome",
+      "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "7",
+      "when": 1795276539700,
+      "tag": "0053_interview_outcome_status_check",
+      "breakpoints": true
+    }
+  ]
 }

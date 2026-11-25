@@ -1,4 +1,4 @@
-import { DEV_PASSWORD } from '@jobbank/db/seed/dev-data';
+import { getSeedDevPassword } from '@jobbank/db/seed/dev-data';
 import * as OTPAuth from 'otpauth';
 import postgres from 'postgres';
 import { afterAll, expect } from 'vitest';
@@ -19,6 +19,13 @@ type Route = (
 /** Minimal cookie jar: keeps name=value pairs from Set-Cookie, drops cleared ones. */
 export class Jar {
   private cookies = new Map<string, string>();
+
+  /**
+   * Short-lived 2FA setup token from a `two_factor_setup_required` login
+   * (audit H-02): a never-enrolled 2FA-required admin gets no session, only
+   * this token, which buys exactly the enrolment call.
+   */
+  setupToken?: string;
 
   absorb(response: Response) {
     for (const raw of response.headers.getSetCookie()) {
@@ -55,6 +62,17 @@ export async function call(
 ): Promise<{ status: number; body: ResponseBody }> {
   const headers: Record<string, string> = { ...options.headers };
   if (options.body !== undefined) headers['content-type'] = 'application/json';
+  // Mutations require an Idempotency-Key (PRD §8); the UI sends one on every
+  // form, so the helper generates one unless the caller supplied its own.
+  // Never override an explicit key — replay tests depend on it.
+  const method = options.method ?? 'GET';
+  if (
+    (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') &&
+    !headers['idempotency-key'] &&
+    !headers['Idempotency-Key']
+  ) {
+    headers['idempotency-key'] = crypto.randomUUID();
+  }
   const cookie = options.jar?.header();
   if (cookie) headers.cookie = cookie;
   const response = await route(
@@ -113,7 +131,7 @@ const routes = {
 };
 
 /** Signs in with email + password; completes the authenticator step when the account has one. */
-export async function signIn(email: string, password = DEV_PASSWORD): Promise<Jar> {
+export async function signIn(email: string, password = getSeedDevPassword()): Promise<Jar> {
   const jar = new Jar();
   const res = await call(await routes.login(), '/api/v1/auth/login', {
     method: 'POST',
@@ -121,7 +139,10 @@ export async function signIn(email: string, password = DEV_PASSWORD): Promise<Ja
     jar,
   });
   expect(res.status, `login ${email}: ${JSON.stringify(res.body)}`).toBe(200);
-  if (res.body.data.kind === 'two_factor_required') {
+  if (res.body.data.kind === 'two_factor_setup_required') {
+    // H-02: no session yet — enrolment buys its pending session with this token.
+    jar.setupToken = res.body.data.setupToken;
+  } else if (res.body.data.kind === 'two_factor_required') {
     const second = await call(await routes.verify2fa(), '/api/v1/auth/2fa/verify', {
       method: 'POST',
       body: { code: totpCode(email) },
@@ -132,15 +153,19 @@ export async function signIn(email: string, password = DEV_PASSWORD): Promise<Ja
   return jar;
 }
 
-/** Enrols an authenticator for an already signed-in session; returns the backup codes. */
+/** Enrols an authenticator; returns the backup codes. */
 export async function enrollTwoFactor(
   email: string,
   jar: Jar,
-  password = DEV_PASSWORD,
+  password = getSeedDevPassword(),
 ): Promise<string[]> {
+  // A never-enrolled admin holds no session — enrol with the setup token
+  // login issued (H-02). A signed-in session enrols with the password alone.
+  const body: { password: string; setupToken?: string } = { password };
+  if (jar.setupToken) body.setupToken = jar.setupToken;
   const start = await call(await routes.enroll(), '/api/v1/account/2fa/enroll', {
     method: 'POST',
-    body: { password },
+    body,
     jar,
   });
   expect(start.status, JSON.stringify(start.body)).toBe(200);
@@ -154,8 +179,8 @@ export async function enrollTwoFactor(
   return start.body.data.backupCodes;
 }
 
-/** Fresh admin session with two-factor enrolled (Super Admin / Branch Admin require it). */
-export async function signInAdmin(email: string): Promise<Jar> {
+/** Fresh session with two-factor enrolled (any 2FA-required role: Super Admin, Branch Admin, Verifier, Interviewer-Scheduler, Staff, Employer). */
+export async function signInWith2fa(email: string): Promise<Jar> {
   if (!totpSecrets.has(email)) {
     await resetTwoFactor(email);
     const jar = await signIn(email);
@@ -163,6 +188,11 @@ export async function signInAdmin(email: string): Promise<Jar> {
     return jar;
   }
   return signIn(email);
+}
+
+/** Fresh session with two-factor enrolled (any 2FA-required role). */
+export async function signInAdmin(email: string): Promise<Jar> {
+  return signInWith2fa(email);
 }
 
 export const uniqueEmail = (prefix: string) =>

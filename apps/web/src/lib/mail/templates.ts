@@ -54,15 +54,17 @@ export function passwordResetEmail(input: { name: string; url: string; expiresMi
   };
 }
 
-export function signInCodeEmail(input: { code: string; expiresMinutes: number }) {
+/** Audit 2026-11-11 (M-28): tell the user their authenticator was removed. */
+export function twoFactorResetEmail(input: { name: string; reason: string }) {
   const lines = [
-    `Your Saylani Job Bank sign-in code is ${input.code}.`,
-    `It expires in ${input.expiresMinutes} minutes. Never share this code with anyone — Job Bank staff will never ask for it.`,
+    `Assalam-o-Alaikum ${input.name},`,
+    `An administrator removed the authenticator (two-factor authentication) from your Saylani Job Bank account. Reason given: ${input.reason}`,
+    'You will be asked to set up two-factor authentication again at your next sign-in. If you did not ask for this, contact your branch admin immediately — someone may have changed your account without your knowledge.',
   ];
   return {
-    subject: `${input.code} is your Saylani Job Bank sign-in code`,
+    subject: 'Your Saylani Job Bank authenticator was removed',
     text: lines.join('\n\n'),
-    html: layout('Your sign-in code', lines),
+    html: layout('Your authenticator was removed', lines),
   };
 }
 
@@ -101,7 +103,7 @@ export function companySubmittedEmail(input: {
 }) {
   const lines = [
     `Assalam-o-Alaikum ${input.name},`,
-    `Thank you — we received ${input.companyName}'s registration. A verification officer will review it, usually by ${input.dueDate}.`,
+    `Thank you — we received ${input.companyName}'s registration. Your branch admin will review it, usually by ${input.dueDate}.`,
     'We will email you if we need anything else. You can follow the progress on your company page.',
   ];
   return {
@@ -119,7 +121,7 @@ export function companyInfoRequestedEmail(input: {
 }) {
   const lines = [
     `Assalam-o-Alaikum ${input.name},`,
-    `Our verification officer needs more information before ${input.companyName} can be verified:`,
+    `Your branch admin needs more information before ${input.companyName} can be verified:`,
     input.request,
     'Please update your registration and press "Send for review" when done.',
   ];

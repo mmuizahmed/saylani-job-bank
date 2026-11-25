@@ -1,7 +1,19 @@
 import 'server-only';
 import { schema } from '@jobbank/db';
-import type { GenderPreference, JobStatus, JobType, ShiftType, SkillLevel } from '@jobbank/shared';
-import { asc, desc, eq } from 'drizzle-orm';
+import type {
+  BonusBasis,
+  BonusFrequency,
+  BonusTier,
+  ExperienceLevel,
+  GenderPreference,
+  JobStatus,
+  JobType,
+  MedicalCoverageScope,
+  MedicalCoverageType,
+  ShiftType,
+  SkillLevel,
+} from '@jobbank/shared';
+import { asc, desc, eq, inArray } from 'drizzle-orm';
 import { NotFoundError } from '@/domains/shared/errors';
 import { db, type DbExecutor } from '@/lib/db';
 
@@ -29,6 +41,8 @@ export interface JobLocationView {
 export interface JobRequirementsView {
   educationLevelCode: string | null;
   minExperienceYears: number | null;
+  experienceLevel: ExperienceLevel | null;
+  minExperienceMonths: number | null;
   languageCodes: string[];
   otherRequirements: string | null;
 }
@@ -48,6 +62,8 @@ export interface JobView {
   description: string;
   jobType: JobType;
   shift: ShiftType;
+  shiftHours: number | null;
+  designationCode: string | null;
   genderPreference: GenderPreference;
   vacancies: number;
   vacanciesFilled: number;
@@ -57,6 +73,26 @@ export interface JobView {
   closesAt: string | null;
   publishedAt: string | null;
   closedAt: string | null;
+  reopenedAt: string | null;
+  // Benefits & Perks
+  fuelAllowance: boolean;
+  flexibleHours: boolean;
+  annualLeaveDays: number | null;
+  sickLeaveDays: number | null;
+  casualLeaveDays: number | null;
+  medicalCoverage: MedicalCoverageType;
+  opdLimit: number | null;
+  ipdLimit: number | null;
+  medicalCoverageScope: MedicalCoverageScope | null;
+  bonusTier: BonusTier;
+  bonusBasis: BonusBasis | null;
+  bonusAmountPkr: number | null;
+  bonusFrequency: BonusFrequency | null;
+  workFromHome: boolean;
+  providentFund: boolean;
+  transportAllowance: boolean;
+  eobi: boolean;
+  lifeInsurance: boolean;
   locations: JobLocationView[];
   requirements: JobRequirementsView | null;
   skills: JobSkillView[];
@@ -78,13 +114,18 @@ export async function loadJob(
   return row;
 }
 
-export async function buildJobView(executor: DbExecutor, row: JobRow): Promise<JobView> {
-  const [locations, [reqs], skills] = await Promise.all([
-    executor.select().from(jl).where(eq(jl.jobId, row.id)).orderBy(asc(jl.createdAt)),
-    executor.select().from(jr).where(eq(jr.jobId, row.id)),
-    executor.select().from(js).where(eq(js.jobId, row.id)).orderBy(asc(js.skillCode)),
-  ]);
-
+/**
+ * Pure assembly of a JobView from a job row plus its already-loaded child
+ * rows (locations in createdAt order, at most one requirements row, skills
+ * in skillCode order). Shared by the single- and batch loaders so both
+ * return identical views.
+ */
+function toJobView(
+  row: JobRow,
+  locations: JobLocationRow[],
+  reqs: JobRequirementsRow | undefined,
+  skills: JobSkillRow[],
+): JobView {
   return {
     id: row.id,
     companyId: row.companyId,
@@ -94,6 +135,8 @@ export async function buildJobView(executor: DbExecutor, row: JobRow): Promise<J
     description: row.description,
     jobType: row.jobType as JobType,
     shift: row.shift as ShiftType,
+    shiftHours: row.shiftHours,
+    designationCode: row.designationCode,
     genderPreference: row.genderPreference as GenderPreference,
     vacancies: row.vacancies,
     vacanciesFilled: row.vacanciesFilled,
@@ -103,6 +146,25 @@ export async function buildJobView(executor: DbExecutor, row: JobRow): Promise<J
     closesAt: row.closesAt?.toISOString() ?? null,
     publishedAt: row.publishedAt?.toISOString() ?? null,
     closedAt: row.closedAt?.toISOString() ?? null,
+    reopenedAt: row.reopenedAt?.toISOString() ?? null,
+    fuelAllowance: row.fuelAllowance,
+    flexibleHours: row.flexibleHours,
+    annualLeaveDays: row.annualLeaveDays,
+    sickLeaveDays: row.sickLeaveDays,
+    casualLeaveDays: row.casualLeaveDays,
+    medicalCoverage: row.medicalCoverage as MedicalCoverageType,
+    opdLimit: row.opdLimit,
+    ipdLimit: row.ipdLimit,
+    medicalCoverageScope: row.medicalCoverageScope as MedicalCoverageScope | null,
+    bonusTier: row.bonusTier as BonusTier,
+    bonusBasis: row.bonusBasis as BonusBasis | null,
+    bonusAmountPkr: row.bonusAmountPkr,
+    bonusFrequency: row.bonusFrequency as BonusFrequency | null,
+    workFromHome: row.workFromHome,
+    providentFund: row.providentFund,
+    transportAllowance: row.transportAllowance,
+    eobi: row.eobi,
+    lifeInsurance: row.lifeInsurance,
     locations: locations.map((l) => ({
       id: l.id,
       companyLocationId: l.companyLocationId,
@@ -114,6 +176,8 @@ export async function buildJobView(executor: DbExecutor, row: JobRow): Promise<J
       ? {
           educationLevelCode: reqs.educationLevelCode,
           minExperienceYears: reqs.minExperienceYears,
+          experienceLevel: reqs.experienceLevel as ExperienceLevel | null,
+          minExperienceMonths: reqs.minExperienceMonths,
           languageCodes: reqs.languageCodes ?? [],
           otherRequirements: reqs.otherRequirements,
         }
@@ -127,6 +191,52 @@ export async function buildJobView(executor: DbExecutor, row: JobRow): Promise<J
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
+}
+
+export async function buildJobView(executor: DbExecutor, row: JobRow): Promise<JobView> {
+  const [locations, [reqs], skills] = await Promise.all([
+    executor.select().from(jl).where(eq(jl.jobId, row.id)).orderBy(asc(jl.createdAt)),
+    executor.select().from(jr).where(eq(jr.jobId, row.id)),
+    executor.select().from(js).where(eq(js.jobId, row.id)).orderBy(asc(js.skillCode)),
+  ]);
+  return toJobView(row, locations, reqs, skills);
+}
+
+/**
+ * Batch loader: the same three child-table queries for ANY number of jobs
+ * (3 queries total, not 3 per job). `listJobsForEmployer` and the staff job
+ * lists map one row per job through `buildJobView` today, so N jobs cost
+ * 3N queries; callers that switch to this keep the identical views. Rows
+ * come back in the input order.
+ */
+export async function buildJobViews(executor: DbExecutor, rows: JobRow[]): Promise<JobView[]> {
+  if (rows.length === 0) return [];
+  const ids = rows.map((r) => r.id);
+  const [locations, reqs, skills] = await Promise.all([
+    executor.select().from(jl).where(inArray(jl.jobId, ids)).orderBy(asc(jl.createdAt)),
+    executor.select().from(jr).where(inArray(jr.jobId, ids)),
+    executor.select().from(js).where(inArray(js.jobId, ids)).orderBy(asc(js.skillCode)),
+  ]);
+  const byJob = <T extends { jobId: string }>(list: T[]): Map<string, T[]> => {
+    const map = new Map<string, T[]>();
+    for (const item of list) {
+      const bucket = map.get(item.jobId);
+      if (bucket) bucket.push(item);
+      else map.set(item.jobId, [item]);
+    }
+    return map;
+  };
+  const locationsByJob = byJob(locations);
+  const reqsByJob = byJob(reqs);
+  const skillsByJob = byJob(skills);
+  return rows.map((row) =>
+    toJobView(
+      row,
+      locationsByJob.get(row.id) ?? [],
+      reqsByJob.get(row.id)?.[0],
+      skillsByJob.get(row.id) ?? [],
+    ),
+  );
 }
 
 export async function getJob(jobId: string): Promise<JobView> {

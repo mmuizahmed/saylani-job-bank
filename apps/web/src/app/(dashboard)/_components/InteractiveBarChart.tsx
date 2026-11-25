@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { BarChart3, MoreHorizontal } from 'lucide-react';
 
 const MONTHS_SHORT = [
@@ -29,18 +30,26 @@ function getVisibleRange(period: Period, currentMonth: number) {
 export function InteractiveBarChart({
   values,
   peak,
+  currentMonth,
   color = '#0d7a3e',
   label,
 }: {
   values: number[];
+  /**
+   * Full-year peak (max of all 12 months). Every tab scales against this
+   * same value, so one month renders at the same height on "This Year",
+   * "Last 6M" and "Last 3M". `currentMonth` is derived once on the server
+   * (PKT) and passed down, so the chart never reads a second clock.
+   */
   peak: number;
+  /** 0-based PKT month of "now", from the server. */
+  currentMonth: number;
   color?: string;
   label: string;
 }) {
   const [period, setPeriod] = useState<Period>('This Year');
   const [hovered, setHovered] = useState<number | null>(null);
 
-  const currentMonth = new Date().getMonth();
   const { start, count } = getVisibleRange(period, currentMonth);
   const visibleMonths = Array.from({ length: count }, (_, i) => start + i);
 
@@ -48,14 +57,14 @@ export function InteractiveBarChart({
   const H = 160;
   const barW = 28;
   const gap = (W - count * barW) / (count + 1);
-  const peakVal = Math.max(
-    ...visibleMonths.map((i) => (i <= currentMonth ? (values[i] ?? 0) : 0)),
-    1,
-  );
-  const yLabels = [0, Math.round(peakVal * 0.5), peakVal];
+  const peakVal = Math.max(peak, 1);
+  // Deduped: at peak 1 the naive [0, 1, 1] would print "1" twice.
+  const yLabels = peakVal <= 1 ? [0, 1] : [...new Set([0, Math.round(peakVal * 0.5), peakVal])];
 
   return (
-    <div className="rounded-2xl border bg-white p-6" style={{ borderColor: '#e8eeed' }}>
+    // Theme surface, not hardcoded white: in dark mode the white card made
+    // the var(--fg) title and var(--fg-muted) legend unreadable.
+    <div className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <BarChart3 className="size-4" style={{ color: '#0d7a3e' }} aria-hidden="true" />
@@ -201,8 +210,13 @@ export function InteractiveBarChart({
 
 /* ─── Three-dot card menu ────────────────────────────────────────────── */
 
-export function CardActionMenu({ items }: { items: { label: string; onClick?: () => void }[] }) {
+export function CardActionMenu({
+  items,
+}: {
+  items: { label: string; onClick?: () => void; action?: 'refresh' }[];
+}) {
   const [open, setOpen] = useState(false);
+  const router = useRouter();
 
   return (
     <div className="relative">
@@ -226,7 +240,10 @@ export function CardActionMenu({ items }: { items: { label: string; onClick?: ()
                 type="button"
                 onClick={() => {
                   setOpen(false);
-                  item.onClick?.();
+                  // 'refresh' re-runs the server components (live data on
+                  // every load); anything else is a caller-supplied handler.
+                  if (item.action === 'refresh') router.refresh();
+                  else item.onClick?.();
                 }}
                 className="text-fg hover:bg-surface-muted flex w-full items-center rounded-lg px-3 py-2 text-left text-sm transition-colors"
               >

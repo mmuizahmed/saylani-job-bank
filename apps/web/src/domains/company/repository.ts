@@ -12,7 +12,7 @@ import {
   type MasterDataMeta,
   type VerificationState,
 } from '@jobbank/shared';
-import { and, asc, desc, eq, inArray, isNull } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, isNull, or } from 'drizzle-orm';
 import { getBranchContact, type BranchContact } from '@/domains/branch';
 import {
   assertActiveMasterData,
@@ -79,6 +79,8 @@ export interface VerificationSummary {
   id: string;
   round: number;
   state: VerificationState;
+  /** Verifier the round is currently claimed by, if any (audit 2026-11-10, H9). */
+  assignedVerifierId: string | null;
   submittedAt: string;
   clockStartedAt: string;
   /** Pakistan calendar date the verifier should decide by. */
@@ -100,7 +102,7 @@ export interface CompanyView {
     legalName: string;
     tradeName: string | null;
     legalStructure: LegalStructure;
-    ntn: string;
+    ntn: string | null;
     registrationNo: string | null;
     industryCode: string;
     sizeBand: CompanySizeBand;
@@ -114,12 +116,23 @@ export interface CompanyView {
   documents: CompanyDocumentView[];
   /** Document type codes this legal structure must upload. */
   requiredDocuments: string[];
+  /**
+   * Active company document types that are NOT required for this legal
+   * structure (2026-11-13: NTN certificate, SECP registration, address
+   * proof). The wizard shows them as "Optional" — uploadable, but never
+   * blocking submission or verification.
+   */
+  optionalDocuments: string[];
   /** What still blocks (re)submission, in plain words (empty = ready). */
   missing: string[];
   /** Latest verification round (open or decided). */
   verification: VerificationSummary | null;
   editable: CompanyEditability;
   verifiedAt: string | null;
+  /** When the first-counter paper form was verified and signed (null until then). */
+  registrationVerifiedSignedAt: string | null;
+  /** Who recorded the verified & signed mark (user id, null until then). */
+  registrationVerifiedSignedBy: string | null;
   createdAt: string;
 }
 
@@ -136,6 +149,52 @@ export async function loadCompany(
   return row;
 }
 
+/**
+ * M18 "proof something changed": anything the employer edited or uploaded after
+ * the verifier's info request. `updated_at` is kept honest by a DB trigger
+ * (migration 0012) on companies, company_locations and company_documents, so
+ * an edit bumps it; contacts carry only createdAt and are deleted +
+ * re-inserted on every save, so a fresh row proves a change.
+ */
+export async function changedSinceInfoRequest(
+  executor: DbExecutor,
+  companyId: string,
+  infoRequestedAt: Date | null,
+): Promise<boolean> {
+  if (!infoRequestedAt) return false;
+  const [company, location, document, contact] = await Promise.all([
+    executor
+      .select({ id: c.id })
+      .from(c)
+      .where(and(eq(c.id, companyId), gt(c.updatedAt, infoRequestedAt)))
+      .limit(1),
+    executor
+      .select({ id: locs.id })
+      .from(locs)
+      .where(and(eq(locs.companyId, companyId), gt(locs.updatedAt, infoRequestedAt)))
+      .limit(1),
+    executor
+      .select({ id: docs.id })
+      .from(docs)
+      .where(
+        and(
+          eq(docs.companyId, companyId),
+          or(
+            gt(docs.uploadedAt, infoRequestedAt),
+            and(eq(docs.reviewStatus, 'ACCEPTED'), gt(docs.reviewedAt, infoRequestedAt)),
+          ),
+        ),
+      )
+      .limit(1),
+    executor
+      .select({ id: contacts.id })
+      .from(contacts)
+      .where(and(eq(contacts.companyId, companyId), gt(contacts.createdAt, infoRequestedAt)))
+      .limit(1),
+  ]);
+  return company.length > 0 || location.length > 0 || document.length > 0 || contact.length > 0;
+}
+
 export async function findCompanyForUser(
   executor: DbExecutor,
   userId: string,
@@ -144,7 +203,8 @@ export async function findCompanyForUser(
   const [member] = await executor
     .select({ companyId: members.companyId })
     .from(members)
-    .where(eq(members.userId, userId));
+    .where(eq(members.userId, userId))
+    .orderBy(asc(members.createdAt));
   return member ? loadCompany(executor, member.companyId, options) : null;
 }
 
@@ -154,6 +214,12 @@ export async function requireOwnCompany(
   actor: Actor,
   options: { forUpdate?: boolean } = {},
 ): Promise<CompanyRow> {
+  // Audit 2026-11-11 (H-03): honour companyId when present — it comes from
+  // the employer's own membership, so honouring it grants nothing new; the
+  // membership lookup below stays the fallback.
+  if (actor.companyId) {
+    return loadCompany(executor, actor.companyId, options);
+  }
   const row = await findCompanyForUser(executor, actor.userId, options);
   if (!row) throw new NotFoundError('Company profile');
   return row;
@@ -269,6 +335,7 @@ export function toVerificationSummary(row: VerificationRow, now = new Date()): V
     id: row.id,
     round: row.round,
     state: row.state,
+    assignedVerifierId: row.assignedVerifierId ?? null,
     submittedAt: row.submittedAt.toISOString(),
     clockStartedAt: row.clockStartedAt.toISOString(),
     slaDueOn: row.slaDueOn,
@@ -288,19 +355,38 @@ export function toVerificationSummary(row: VerificationRow, now = new Date()): V
  * What still blocks submission: a main contact, the head office + branch, and every required
  * document for the legal structure (a document the verifier rejected must be replaced).
  */
-export async function submissionMissing(executor: DbExecutor, row: CompanyRow): Promise<string[]> {
-  const [contactRows, [hq], required, current] = await Promise.all([
-    executor
-      .select({ isPrimary: contacts.isPrimary })
-      .from(contacts)
-      .where(eq(contacts.companyId, row.id)),
-    executor
-      .select({ id: locs.id })
-      .from(locs)
-      .where(and(eq(locs.companyId, row.id), eq(locs.kind, 'HQ'))),
-    requiredDocumentTypes(executor, row.legalStructure),
-    currentDocuments(executor, row.id),
-  ]);
+/**
+ * Inputs submissionMissing needs, already fetched by the caller (buildCompanyView
+ * loads every one of these rows anyway). Pass them in to avoid re-querying; when
+ * omitted, submissionMissing fetches them itself.
+ */
+export interface SubmissionMissingPreload {
+  contactRows: { isPrimary: boolean }[];
+  hq: { id: string } | undefined;
+  required: CompanyDocumentType[];
+  current: CompanyDocumentRow[];
+}
+
+export async function submissionMissing(
+  executor: DbExecutor,
+  row: CompanyRow,
+  preloaded?: SubmissionMissingPreload,
+): Promise<string[]> {
+  const [contactRows, hq, required, current] = preloaded
+    ? [preloaded.contactRows, preloaded.hq, preloaded.required, preloaded.current]
+    : await Promise.all([
+        executor
+          .select({ isPrimary: contacts.isPrimary })
+          .from(contacts)
+          .where(eq(contacts.companyId, row.id)),
+        executor
+          .select({ id: locs.id })
+          .from(locs)
+          .where(and(eq(locs.companyId, row.id), eq(locs.kind, 'HQ')))
+          .then((rows) => rows[0]),
+        requiredDocumentTypes(executor, row.legalStructure),
+        currentDocuments(executor, row.id),
+      ]);
   const missing: string[] = [];
   if (!contactRows.some((r) => r.isPrimary)) missing.push('a main contact person');
   if (!hq || !row.branchId) missing.push('the head office location and branch');
@@ -336,7 +422,7 @@ export async function buildCompanyView(
   executor: DbExecutor,
   row: CompanyRow,
 ): Promise<CompanyView> {
-  const [contactRows, locationRows, documents, required, latest, branch, missing] =
+  const [contactRows, locationRows, documents, required, allTypes, latest, branch] =
     await Promise.all([
       executor
         .select()
@@ -350,11 +436,20 @@ export async function buildCompanyView(
         .orderBy(asc(locs.createdAt)),
       currentDocuments(executor, row.id),
       requiredDocumentTypes(executor, row.legalStructure),
+      companyDocumentTypes(executor),
       latestVerification(executor, row.id),
       row.branchId ? getBranchContact(row.branchId, executor) : Promise.resolve(null),
-      submissionMissing(executor, row),
     ]);
   const hq = locationRows.find((l) => l.kind === 'HQ');
+  // submissionMissing reuses the rows already fetched above instead of
+  // re-querying contacts, the HQ location, the required types and the
+  // documents (it used to add 5 more queries, 2 of them duplicates).
+  const missing = await submissionMissing(executor, row, {
+    contactRows,
+    hq,
+    required,
+    current: documents,
+  });
   return {
     id: row.id,
     status: row.status,
@@ -381,10 +476,17 @@ export async function buildCompanyView(
     sites: locationRows.filter((l) => l.kind === 'SITE').map(toLocationView),
     documents: documents.map(toDocumentView),
     requiredDocuments: required.map((t) => t.code),
+    // Optional = every active company document type that isn't required
+    // for this legal structure (NTN / SECP / address proof since 2026-11-13).
+    optionalDocuments: allTypes
+      .filter((t) => t.isActive && !required.some((r) => r.code === t.code))
+      .map((t) => t.code),
     missing,
     verification: latest ? toVerificationSummary(latest) : null,
     editable: companyEditability(row.status),
     verifiedAt: row.verifiedAt?.toISOString() ?? null,
+    registrationVerifiedSignedAt: row.registrationVerifiedSignedAt?.toISOString() ?? null,
+    registrationVerifiedSignedBy: row.registrationVerifiedSignedBy,
     createdAt: row.createdAt.toISOString(),
   };
 }

@@ -11,9 +11,10 @@ import type {
   SkillsInput,
   UpdatePersonalInput,
 } from '@jobbank/shared';
-import { eq } from 'drizzle-orm';
+import { and, eq, ilike, ne, sql } from 'drizzle-orm';
 import { getBranchContact, listBranchOptions, type BranchOption } from '@/domains/branch';
-import { assertActiveMasterData, resolveMatchRadius } from '@/domains/settings';
+import { toGeography } from '@/lib/geospatial';
+import { assertActiveMasterData } from '@/domains/settings';
 import { recordAudit, runCommand, type CommandScope } from '@/domains/shared/audit';
 import {
   ConflictError,
@@ -24,6 +25,7 @@ import {
 import { assertPermission, type Actor } from '@/domains/shared/scope';
 import { db, type DbExecutor } from '@/lib/db';
 import { applicantMachine } from './machine';
+import { withRegistrationReference } from './registration-reference';
 import {
   a,
   addr,
@@ -31,6 +33,7 @@ import {
   buildProfile,
   cert,
   cnicOwner,
+  completenessFor,
   edu,
   exp,
   findApplicantForUser,
@@ -91,7 +94,38 @@ export async function myBranchOptions(actor: Actor, point: GeoPoint): Promise<Br
 
 // ─── Registration & personal details ───────────────────────────────────
 
-/** Step 1 of the wizard: creates the DRAFT profile for the signed-in phone account. */
+/**
+ * Another applicant already uses this contact email (S3). The `applicants.email`
+ * column has no unique index, so the check lives here — 409 with EMAIL_TAKEN,
+ * like the staff-invite email check. (A DB unique index would close the
+ * concurrent-submit race; that needs a schema change outside this fix.)
+ * Emails are lowercased by the zod schema, so an exact match is enough.
+ *
+ * Decision (2026-11-08): do NOT add that unique index. One email address
+ * routinely belongs to a whole household — a parent or sibling registers
+ * several family members from a single shared inbox, and a unique index
+ * would block every registration after the first. The app-level check above
+ * is the deliberate trade-off: it stops accidental duplicates in normal use
+ * while a shared family email still registers. Revisit only if duplicate
+ * emails become an abuse vector rather than a family pattern.
+ */
+export async function assertEmailFree(
+  executor: DbExecutor,
+  email: string,
+  exceptId?: string,
+): Promise<void> {
+  const [other] = await executor
+    .select({ id: a.id })
+    .from(a)
+    .where(and(eq(a.email, email), exceptId ? ne(a.id, exceptId) : undefined));
+  if (other) {
+    throw new ConflictError('Another applicant is already registered with this email address.', {
+      reason: 'EMAIL_TAKEN',
+    });
+  }
+}
+
+/** Step 1 of the wizard: creates the profile for the signed-in phone account. It is ACTIVE from creation (no DRAFT status since 2026-11-09), even before the location step assigns a branch. */
 export async function registerApplicant(
   ctx: SignedIn,
   input: RegisterApplicantInput,
@@ -105,18 +139,23 @@ export async function registerApplicant(
       }
       const owner = await cnicOwner(tx, input.cnic);
       if (owner) throw await cnicTakenError(tx, owner);
-      const [row] = await tx
-        .insert(a)
-        .values({
-          userId: ctx.actor.userId,
-          fullName: input.fullName,
-          fatherName: input.fatherName,
-          cnic: input.cnic,
-          dateOfBirth: input.dateOfBirth,
-          gender: input.gender,
-          email: input.email ?? null,
-        })
-        .returning();
+      if (input.email) await assertEmailFree(tx, input.email);
+      const [row] = await withRegistrationReference(tx, {}, (registrationReference) =>
+        tx
+          .insert(a)
+          .values({
+            userId: ctx.actor.userId,
+            registrationReference,
+            fullName: input.fullName,
+            fatherName: input.fatherName,
+            cnic: input.cnic,
+            dateOfBirth: input.dateOfBirth,
+            gender: input.gender,
+            email: input.email ?? null,
+            activatedAt: new Date(),
+          })
+          .returning(),
+      );
       // The account was created by phone sign-in with a placeholder name.
       await tx
         .update(schema.users)
@@ -185,6 +224,7 @@ export async function updateMyPersonal(
       const owner = await cnicOwner(tx, changes.cnic, row.id);
       if (owner) throw await cnicTakenError(tx, owner);
     }
+    if (changes.email) await assertEmailFree(tx, changes.email, row.id);
     // Fixing details after a failed check sends the profile back for a new check.
     const identityStatus =
       identityChanged && row.identityStatus === 'REJECTED' ? 'UNVERIFIED' : row.identityStatus;
@@ -235,37 +275,63 @@ export async function setMyLocation(
         ]);
       }
     }
-    const branch = await getBranchContact(input.branchId, tx);
-    if (!branch?.isActive) {
-      throw new ValidationError([{ path: 'branchId', message: 'Choose an active branch' }]);
+    // Auto-assign: the active branch in the chosen city NEAREST to the
+    // applicant's pin. The applicant never picks a branch; the system assigns
+    // one so the DB constraint holds. Nearest-first, not an arbitrary row:
+    // once a second active branch exists in the city, an unordered pick
+    // silently assigns the wrong branch (and the CNIC-taken message, the
+    // branch list and staff transfers all point at it instead).
+    const cityLabel = city.label; // e.g. "Karachi"
+    const distance = sql<
+      number | null
+    >`ST_Distance(${schema.branches.location}, ${toGeography(input.location)})`;
+    const cityBranches = await tx
+      .select({ id: schema.branches.id })
+      .from(schema.branches)
+      .where(and(ilike(schema.branches.city, cityLabel), eq(schema.branches.isActive, true)))
+      .orderBy(sql`${distance} asc nulls last`)
+      .limit(1);
+    // Staff entering an address for a counter candidate (ctx.enteredBy set) do not need a
+    // branch in the chosen city: the candidate stays with the branch that registered them.
+    if (cityBranches.length === 0 && !ctx.enteredBy) {
+      throw new ValidationError([
+        {
+          path: 'cityCode',
+          message: `No active branch found for ${cityLabel}. Please contact support.`,
+        },
+      ]);
     }
-    const branchChanged = row.branchId !== input.branchId;
+    // A counter's candidates stay with the branch that registered them; staff can transfer them.
+    const assignedBranchId = ctx.enteredBy ? row.branchId! : cityBranches[0]!.id;
+    const branchChanged = row.branchId !== assignedBranchId;
     if (branchChanged && branchLocked(row)) {
+      // A locked (active) profile cannot move branches on its own — staff transfer only.
+      // Address updates in the same branch still work; only the branch move is refused.
       throw new ForbiddenError(
-        'Your profile is active, so only Job Bank staff can move it to another branch. ' +
-          'Ask your branch to transfer you.',
+        'Your profile is locked to its current branch. Ask branch staff to transfer you.',
       );
     }
 
     const values = {
-      addressLine: input.addressLine,
+      addressLine: input.addressLine ?? '',
       cityCode: input.cityCode,
-      areaCode: input.areaCode,
+      areaCode: input.areaCode ?? null,
       location: input.location,
     };
     await tx
       .insert(addr)
       .values({ applicantId: row.id, ...values })
       .onConflictDoUpdate({ target: addr.applicantId, set: values });
-    if (branchChanged) await tx.update(a).set({ branchId: input.branchId }).where(eq(a.id, row.id));
+    if (branchChanged && !branchLocked(row)) {
+      await tx.update(a).set({ branchId: assignedBranchId }).where(eq(a.id, row.id));
+    }
 
     audit({
       action: 'applicant.update_location',
       entityType: 'applicant',
       entityId: row.id,
-      branchId: input.branchId,
-      // The pin and street address are redacted from the audit log; the codes are kept.
-      after: { ...values, branchId: input.branchId },
+      branchId: assignedBranchId,
+      after: { ...values, branchId: assignedBranchId },
       metadata: { branchChanged },
     });
     await refreshProfileState(cmd, row.id);
@@ -347,12 +413,18 @@ export function saveMyExperience(ctx: SignedIn, input: ExperienceInput) {
 
 export function saveMySkills(ctx: SignedIn, input: SkillsInput) {
   return saveSection(ctx, 'skills', input, async ({ tx }, row) => {
-    await assertActiveMasterData(
-      tx,
-      'SKILL',
-      input.items.map((i) => i.skillCode),
-      (i) => `items.${i}.skillCode`,
-    );
+    // Skills must already exist as active master data (H14): applicants may not
+    // mint new SKILL codes — an unknown code is "not offered", like every other
+    // section. (The old auto-upsert let any applicant inject junk codes into
+    // the shared list every other applicant matches against.)
+    if (input.items.length > 0) {
+      await assertActiveMasterData(
+        tx,
+        'SKILL',
+        input.items.map((item) => item.skillCode),
+        (index) => `items.${index}.skillCode`,
+      );
+    }
     await tx.delete(skl).where(eq(skl.applicantId, row.id));
     if (input.items.length > 0) {
       await tx.insert(skl).values(input.items.map((item) => ({ ...item, applicantId: row.id })));
@@ -401,18 +473,6 @@ export function saveMyPreferences(ctx: SignedIn, input: PreferencesInput) {
       input.categoryCodes,
       (i) => `categoryCodes.${i}`,
     );
-    if (input.willingRadiusM !== null) {
-      // Never wider than the radius the branch matches within (PRD rule 4).
-      const { maxM } = await resolveMatchRadius({ branchId: row.branchId });
-      if (input.willingRadiusM > maxM) {
-        throw new ValidationError([
-          {
-            path: 'willingRadiusM',
-            message: `Your branch matches jobs within ${maxM / 1000} km at most`,
-          },
-        ]);
-      }
-    }
     const values = { ...input };
     await tx
       .insert(pref)
@@ -431,15 +491,15 @@ export async function setMyStatus(
   assertPermission(ctx.actor, 'applicant:self');
   const current = await requireOwnApplicant(db, ctx.actor);
   if (current.status === status) return buildProfile(db, current);
-  if (current.status === 'DRAFT') {
-    throw new ConflictError('Finish setting up your profile first');
-  }
   await runCommand(ctx, async ({ tx, audit }) => {
     const row = await requireOwnApplicant(tx, ctx.actor, { forUpdate: true });
     const event = status === 'INACTIVE' ? 'DEACTIVATE' : 'REACTIVATE';
-    const to = applicantMachine.transition(row.status, event, { activationMissing: [] }, [
-      'APPLICANT',
-    ]);
+    // REACTIVATE re-checks completeness (the machine guards it): a profile that
+    // lost its documents or location while inactive must not come back ACTIVE
+    // and matchable. DEACTIVATE needs no such check, so it is not computed.
+    const activationMissing =
+      event === 'REACTIVATE' ? (await completenessFor(tx, row)).activationMissing : [];
+    const to = applicantMachine.transition(row.status, event, { activationMissing }, ['APPLICANT']);
     await tx.update(a).set({ status: to, statusReason: null }).where(eq(a.id, row.id));
     audit({
       action: status === 'INACTIVE' ? 'applicant.deactivate' : 'applicant.reactivate',

@@ -43,6 +43,7 @@ export const paginationMetaSchema = z.object({
   pageSize: z.number().int().min(1),
   total: z.number().int().min(0),
   pageCount: z.number().int().min(0),
+  unread: z.number().int().min(0).optional(),
 });
 
 export type FieldIssue = z.infer<typeof fieldIssueSchema>;
@@ -63,5 +64,7 @@ export interface ApiPage<T> {
 export const HEADERS = {
   correlationId: 'x-correlation-id',
   idempotencyKey: 'idempotency-key',
+  /** Applicant id a staff member is entering data for, at a counter. */
+  onBehalfOf: 'x-jb-on-behalf-of',
   idempotentReplay: 'idempotent-replayed',
 } as const;

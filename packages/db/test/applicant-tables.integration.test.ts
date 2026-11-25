@@ -19,8 +19,8 @@ beforeAll(async () => {
     INSERT INTO branches (code, name, city) VALUES (${`M6-${suffix.toUpperCase()}`}, 'M6 probe', 'Karachi')
     RETURNING id`;
   [{ id: applicantId }] = await app.client<[{ id: string }]>`
-    INSERT INTO applicants (user_id, full_name, father_name, cnic, date_of_birth, gender)
-    VALUES (${userId}, 'Probe Person', 'Probe Father', ${cnic()}, '1995-01-01', 'MALE')
+    INSERT INTO applicants (user_id, full_name, father_name, cnic, date_of_birth, gender, registration_reference)
+    VALUES (${userId}, 'Probe Person', 'Probe Father', ${cnic()}, '1995-01-01', 'MALE', ${`SJB-TEST-${suffix.toUpperCase()}`})
     RETURNING id`;
 });
 
@@ -32,11 +32,11 @@ const violates = (constraint: string) =>
   expect.objectContaining({ constraint_name: constraint }) as unknown as Error;
 
 describe('applicants', () => {
-  it('starts as an unverified DRAFT with no branch', async () => {
+  it('starts as an ACTIVE profile with no branch', async () => {
     const [row] = await app.client`
       SELECT status, identity_status, branch_id, profile_completeness FROM applicants WHERE id = ${applicantId}`;
     expect(row).toEqual({
-      status: 'DRAFT',
+      status: 'ACTIVE',
       identity_status: 'UNVERIFIED',
       branch_id: null,
       profile_completeness: 0,
@@ -49,10 +49,8 @@ describe('applicants', () => {
     ).rejects.toEqual(violates('applicants_cnic_format'));
   });
 
-  it('cannot leave DRAFT without a branch (matching is per branch)', async () => {
-    await expect(
-      app.client`UPDATE applicants SET status = 'ACTIVE' WHERE id = ${applicantId}`,
-    ).rejects.toEqual(violates('applicants_active_needs_branch'));
+  it('no longer needs a branch to be ACTIVE (DRAFT + branch gate removed in 0038)', async () => {
+    await app.client`UPDATE applicants SET status = 'ACTIVE' WHERE id = ${applicantId}`;
     await app.client`UPDATE applicants SET status = 'ACTIVE', branch_id = ${branchId} WHERE id = ${applicantId}`;
   });
 });
@@ -69,12 +67,11 @@ describe('profile sections', () => {
     ).rejects.toEqual(violates('applicant_experience_dates'));
   });
 
-  it('never lets an applicant ask for more than the 10 km maximum', async () => {
-    await expect(
-      app.client`INSERT INTO applicant_preferences (applicant_id, willing_radius_m) VALUES (${applicantId}, 10001)`,
-    ).rejects.toEqual(violates('applicant_preferences_radius'));
-  });
-
+  // N13 (2026-11-08): the 10 km ceiling used to be tested here against
+  // applicant_preferences.willing_radius_m, but that column is dead — the
+  // radius lives in match_radius_policies since M5, and its ceiling is
+  // covered by 'never allows a radius beyond 10 km' in
+  // settings-tables.integration.test.ts. Migration 0036 drops the column.
   it('indexes the home pin for distance queries', async () => {
     const [index] = await app.client`
       SELECT indexdef FROM pg_indexes WHERE indexname = 'applicant_addresses_location_gix'`;
@@ -95,10 +92,14 @@ describe('identity_verifications', () => {
 });
 
 describe('document types', () => {
-  it('marks only certificates and letters as multi-file', async () => {
+  it('marks certificates, letters and healthcare licences as multi-file', async () => {
     const rows = await app.client<{ code: string }[]>`
       SELECT code FROM master_data
       WHERE type = 'DOCUMENT_TYPE' AND (meta->>'multiple')::boolean ORDER BY code`;
-    expect(rows.map((r) => r.code)).toEqual(['EDUCATION_CERTIFICATE', 'EXPERIENCE_LETTER']);
+    expect(rows.map((r) => r.code)).toEqual([
+      'EDUCATION_CERTIFICATE',
+      'EXPERIENCE_LETTER',
+      'HEALTHCARE_LICENSE',
+    ]);
   });
 });

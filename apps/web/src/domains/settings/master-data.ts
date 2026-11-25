@@ -9,10 +9,11 @@ import {
   type MasterDataItem,
   type MasterDataType,
 } from '@jobbank/shared';
-import { and, asc, eq, gte, inArray, lt, type SQL } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, lt, ne, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import { runCommand, type RequestContext } from '@/domains/shared/audit';
 import { ConflictError, NotFoundError, ValidationError, zodIssues } from '@/domains/shared/errors';
+import { MAX_UNPAGINATED_LIST_ROWS } from '@/domains/shared/pagination';
 import { assertPermission, hasPermission, type Actor } from '@/domains/shared/scope';
 import { db, type DbExecutor } from '@/lib/db';
 
@@ -81,7 +82,8 @@ export async function listMasterData(
     .select(columns)
     .from(md)
     .where(and(...conditions))
-    .orderBy(asc(md.sortOrder), asc(md.label));
+    .orderBy(asc(md.sortOrder), asc(md.label))
+    .limit(MAX_UNPAGINATED_LIST_ROWS);
 }
 
 /** Items of one type with the given codes (active or not), for validating stored references. */
@@ -226,31 +228,36 @@ export async function updateMasterDataItem(
   patch: UpdateMasterDataInput,
 ): Promise<MasterDataItem> {
   assertPermission(ctx.actor, 'master_data:manage');
-  await runCommand(ctx, async ({ tx, audit }) => {
-    const before = await getMasterDataItem(id, tx);
-    const changes: Partial<typeof md.$inferInsert> = Object.fromEntries(
-      Object.entries(patch).filter(([, v]) => v !== undefined),
-    );
-    if (patch.meta !== undefined) changes.meta = parseMeta(before.type, patch.meta);
-    if (patch.parentId !== undefined) await assertValidParent(tx, before.type, patch.parentId, id);
-    if (Object.keys(changes).length === 0) return;
-    await tx.update(md).set(changes).where(eq(md.id, id));
-    audit({
-      action:
-        patch.isActive === false
-          ? 'master_data.deactivate'
-          : patch.isActive === true
-            ? 'master_data.activate'
-            : 'master_data.update',
-      entityType: 'master_data',
-      entityId: id,
-      before: Object.fromEntries(
-        Object.keys(changes).map((k) => [k, before[k as keyof typeof before]]),
-      ),
-      after: changes,
-      metadata: { type: before.type, code: before.code },
-    });
-  });
+  await runCommand(
+    ctx,
+    async ({ tx, audit }) => {
+      const before = await getMasterDataItem(id, tx);
+      const changes: Partial<typeof md.$inferInsert> = Object.fromEntries(
+        Object.entries(patch).filter(([, v]) => v !== undefined),
+      );
+      if (patch.meta !== undefined) changes.meta = parseMeta(before.type, patch.meta);
+      if (patch.parentId !== undefined)
+        await assertValidParent(tx, before.type, patch.parentId, id);
+      if (Object.keys(changes).length === 0) return;
+      await tx.update(md).set(changes).where(eq(md.id, id));
+      audit({
+        action:
+          patch.isActive === false
+            ? 'master_data.deactivate'
+            : patch.isActive === true
+              ? 'master_data.activate'
+              : 'master_data.update',
+        entityType: 'master_data',
+        entityId: id,
+        before: Object.fromEntries(
+          Object.keys(changes).map((k) => [k, before[k as keyof typeof before]]),
+        ),
+        after: changes,
+        metadata: { type: before.type, code: before.code },
+      });
+    },
+    { audited: false },
+  );
   return getMasterDataItem(id);
 }
 
@@ -277,12 +284,24 @@ export const updateHolidaySchema = createHolidaySchema.partial().extend({
 export type CreateHolidayInput = z.infer<typeof createHolidaySchema>;
 export type UpdateHolidayInput = z.infer<typeof updateHolidaySchema>;
 
-/** Holidays in date order; a year narrows the list. */
-export async function listHolidays(query: { year?: number } = {}): Promise<Holiday[]> {
-  const where = query.year
-    ? and(gte(h.date, `${query.year}-01-01`), lt(h.date, `${query.year + 1}-01-01`))
-    : undefined;
-  return db.select(holidayColumns).from(h).where(where).orderBy(asc(h.date));
+/** Holidays in date order; a year narrows the list. Inactive holidays are only shown to managers (same rule as listMasterData) — any signed-in user could otherwise see deactivated holidays. */
+export async function listHolidays(
+  actor: Actor,
+  query: { year?: number; includeInactive?: boolean } = {},
+): Promise<Holiday[]> {
+  const showInactive = query.includeInactive && hasPermission(actor, 'master_data:manage');
+  const conditions: SQL[] = [];
+  if (query.year)
+    conditions.push(
+      and(gte(h.date, `${query.year}-01-01`), lt(h.date, `${query.year + 1}-01-01`))!,
+    );
+  if (!showInactive) conditions.push(eq(h.isActive, true));
+  return db
+    .select(holidayColumns)
+    .from(h)
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(asc(h.date))
+    .limit(MAX_UNPAGINATED_LIST_ROWS);
 }
 
 /** Active holiday dates (for the working-day calendar). */
@@ -315,25 +334,40 @@ export async function updateHoliday(
   patch: UpdateHolidayInput,
 ): Promise<Holiday> {
   assertPermission(ctx.actor, 'master_data:manage');
-  await runCommand(ctx, async ({ tx, audit }) => {
-    const before = await getHoliday(id, tx);
-    const changes = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
-    if (Object.keys(changes).length === 0) return;
-    await tx.update(h).set(changes).where(eq(h.id, id));
-    audit({
-      action:
-        patch.isActive === false
-          ? 'holiday.deactivate'
-          : patch.isActive === true
-            ? 'holiday.activate'
-            : 'holiday.update',
-      entityType: 'holiday',
-      entityId: id,
-      before: Object.fromEntries(
-        Object.keys(changes).map((k) => [k, before[k as keyof typeof before]]),
-      ),
-      after: changes,
-    });
-  });
+  await runCommand(
+    ctx,
+    async ({ tx, audit }) => {
+      const before = await getHoliday(id, tx);
+      const changes = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
+      if (Object.keys(changes).length === 0) return;
+      // Same duplicate-date check as create, excluding this row (M22): without
+      // it an edit onto another holiday's date fails only at the DB index as a
+      // generic PG-23505 409.
+      if (typeof changes.date === 'string') {
+        const date = changes.date;
+        const [taken] = await tx
+          .select({ id: h.id })
+          .from(h)
+          .where(and(eq(h.date, date), ne(h.id, id)));
+        if (taken) throw new ConflictError(`${date} is already a holiday`);
+      }
+      await tx.update(h).set(changes).where(eq(h.id, id));
+      audit({
+        action:
+          patch.isActive === false
+            ? 'holiday.deactivate'
+            : patch.isActive === true
+              ? 'holiday.activate'
+              : 'holiday.update',
+        entityType: 'holiday',
+        entityId: id,
+        before: Object.fromEntries(
+          Object.keys(changes).map((k) => [k, before[k as keyof typeof before]]),
+        ),
+        after: changes,
+      });
+    },
+    { audited: false },
+  );
   return getHoliday(id);
 }

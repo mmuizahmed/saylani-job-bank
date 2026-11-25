@@ -14,11 +14,15 @@ export const TYPE_SINGULAR: Record<MasterDataType, string> = {
   VERIFICATION_REJECTION_REASON: 'verification rejection reason',
   WITHDRAWAL_REASON: 'withdrawal reason',
   INDUSTRY: 'industry',
+  DESIGNATION: 'designation',
 };
 
 /** Groups for the type navigation. */
 export const TYPE_GROUPS: { title: string; types: MasterDataType[] }[] = [
-  { title: 'Jobs & skills', types: ['JOB_CATEGORY', 'SKILL', 'EDUCATION_LEVEL', 'LANGUAGE'] },
+  {
+    title: 'Jobs & skills',
+    types: ['JOB_CATEGORY', 'SKILL', 'EDUCATION_LEVEL', 'LANGUAGE', 'DESIGNATION'],
+  },
   { title: 'Places & documents', types: ['CITY', 'AREA', 'DOCUMENT_TYPE'] },
   { title: 'Companies', types: ['INDUSTRY'] },
   {
@@ -49,10 +53,17 @@ const REASON_TYPES: readonly MasterDataType[] = [
 
 export const isReasonType = (type: MasterDataType) => REASON_TYPES.includes(type);
 
-const subjects = (list: unknown) =>
-  Array.isArray(list)
-    ? list.map((s) => (s === 'APPLICANT' ? 'Applicants' : 'Companies')).join(', ')
-    : '';
+const subjectLabel = (subject: string) =>
+  subject === 'APPLICANT' ? 'Applicants' : subject === 'COMPANY' ? 'Companies' : '';
+
+const subjects = (list: unknown) => {
+  const values = Array.isArray(list) ? list : typeof list === 'string' ? [list] : [];
+
+  return values
+    .map((subject) => (typeof subject === 'string' ? subjectLabel(subject) : ''))
+    .filter(Boolean)
+    .join(', ');
+};
 
 /** One-line summary of an item's type-specific settings, for the table. */
 export function metaSummary(item: MasterDataItem): string | null {
@@ -66,16 +77,19 @@ export function metaSummary(item: MasterDataItem): string | null {
       const types = Array.isArray(m.mimeTypes)
         ? m.mimeTypes.map((t) => MIME_LABELS[t as string] ?? t).join('/')
         : '';
-      return [
-        m.appliesTo === 'COMPANY' ? 'Companies' : 'Applicants',
-        // Company requirements depend on the business type (Settings → Company documents).
-        m.appliesTo === 'COMPANY'
-          ? 'required per business type'
-          : m.required
-            ? 'required'
-            : 'optional',
-        `${types} ≤ ${String(m.maxSizeMb)} MB`,
-      ].join(' · ');
+      const appliesTo = Array.isArray(m.appliesTo)
+        ? m.appliesTo
+        : typeof m.appliesTo === 'string'
+          ? [m.appliesTo]
+          : [];
+      const appliesToLabel = subjects(appliesTo) || 'Applicants';
+      // Company requirements depend on the business type (Settings → Company documents).
+      const requiredState = appliesTo.includes('COMPANY')
+        ? 'required per business type'
+        : m.required
+          ? 'required'
+          : 'optional';
+      return [appliesToLabel, requiredState, `${types} ≤ ${String(m.maxSizeMb)} MB`].join(' · ');
     }
     case 'BLACKLIST_REASON':
       return [subjects(m.appliesTo), m.requiresNote ? 'note required' : null]

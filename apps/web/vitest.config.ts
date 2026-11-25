@@ -1,8 +1,7 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import react from '@vitejs/plugin-react';
 import { parse } from 'dotenv';
-import { readFileSync } from 'node:fs';
 import { defineConfig } from 'vitest/config';
 
 const alias = {
@@ -10,7 +9,6 @@ const alias = {
   'server-only': fileURLToPath(new URL('./src/test/server-only-stub.ts', import.meta.url)),
 };
 
-// Integration tests use the root .env, pointed at the isolated `jobbank_test` database.
 const rootEnvPath = fileURLToPath(new URL('../../.env', import.meta.url));
 const rootEnv = existsSync(rootEnvPath) ? parse(readFileSync(rootEnvPath)) : {};
 const withDatabase = (url: string | undefined, name: string) => {
@@ -20,9 +18,15 @@ const withDatabase = (url: string | undefined, name: string) => {
   return parsed.toString();
 };
 const testDb = process.env.TEST_DATABASE_NAME ?? 'jobbank_test';
-const testMigratorUrl = withDatabase(rootEnv.DATABASE_MIGRATOR_URL, testDb);
+const testMigratorUrl =
+  process.env.TEST_DATABASE_MIGRATOR_URL ??
+  withDatabase(process.env.DATABASE_MIGRATOR_URL ?? rootEnv.DATABASE_MIGRATOR_URL, testDb);
+const testRuntimeUrl = withDatabase(process.env.DATABASE_URL ?? rootEnv.DATABASE_URL, testDb);
 // globalSetup runs in this (main) process, where `test.env` does not apply.
 process.env.TEST_DATABASE_MIGRATOR_URL ??= testMigratorUrl;
+// Same for the seed password: globalSetup seeds the test DB in this process,
+// so test.env (workers only) never reaches it. Mirrors the URL line above.
+process.env.SEED_DEV_PASSWORD ??= rootEnv.SEED_DEV_PASSWORD ?? '';
 
 export default defineConfig({
   test: {
@@ -34,7 +38,14 @@ export default defineConfig({
           environment: 'node',
           include: ['src/**/*.test.ts'],
           exclude: ['src/**/*.integration.test.ts'],
-          env: { SKIP_ENV_VALIDATION: '1', LOG_LEVEL: 'silent' },
+          env: {
+            SKIP_ENV_VALIDATION: '1',
+            LOG_LEVEL: 'silent',
+            // Audit 2026-11-11 (M-33): dummy test-only secret (≥32 chars) —
+            // without it the OTP tests fail on a clean checkout because
+            // getAuthSecret() throws. Never a real secret.
+            BETTER_AUTH_SECRET: 'unit-test-secret-unit-test-secret-unit-test',
+          },
         },
       },
       {
@@ -60,12 +71,15 @@ export default defineConfig({
           hookTimeout: 60_000,
           env: {
             ...rootEnv,
+            ...process.env,
             NODE_ENV: 'test',
             LOG_LEVEL: 'silent',
-            DATABASE_URL: withDatabase(rootEnv.DATABASE_URL, testDb),
+            DATABASE_URL: testRuntimeUrl,
             TEST_DATABASE_MIGRATOR_URL: testMigratorUrl,
-            // Deterministic auth secret, and in-memory rate limits (no cross-run Redis state).
             BETTER_AUTH_SECRET: 'integration-test-secret-integration-test-secret',
+            // Seed password for the test DB (from CI env or root .env). No default:
+            // getSeedDevPassword() fails fast with instructions if it is missing.
+            SEED_DEV_PASSWORD: process.env.SEED_DEV_PASSWORD ?? rootEnv.SEED_DEV_PASSWORD ?? '',
             REDIS_URL: '',
             MAIL_TRANSPORT: 'memory',
           },

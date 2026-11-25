@@ -1,5 +1,7 @@
 export {
   createNotification,
+  createNotifications,
+  getNewNotificationsSince,
   listMyNotifications,
   markAllNotificationsRead,
   markNotificationRead,

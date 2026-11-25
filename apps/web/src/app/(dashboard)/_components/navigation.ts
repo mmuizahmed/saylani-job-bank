@@ -1,14 +1,16 @@
 import type { Role } from '@jobbank/shared';
 import { ROLE_HOME } from '@jobbank/shared';
 import {
+  Bell,
   Building2,
-  CheckSquare,
+  Calendar,
   Contact,
   FileText,
   Briefcase,
   Gauge,
   ListTree,
   SlidersHorizontal,
+  TrendingUp,
   UserRound,
   Users,
   type LucideIcon,
@@ -25,7 +27,10 @@ export interface NavItemConfig {
  * Sidebar per role. Each module adds its pages here as they are delivered
  * (only routes that exist are listed — no dead links).
  */
-export function navigationFor(role: Role): { title?: string; items: NavItemConfig[] }[] {
+export function navigationFor(
+  role: Role,
+  opts: { hideEmployerJobs?: boolean } = {},
+): { title?: string; items: NavItemConfig[] }[] {
   const overview: NavItemConfig = {
     href: ROLE_HOME[role],
     label: 'Overview',
@@ -62,8 +67,8 @@ export function navigationFor(role: Role): { title?: string; items: NavItemConfi
         {
           items: [
             overview,
-            { href: '/branch-admin/applicants', label: 'Applicants', icon: Contact },
             { href: '/branch-admin/companies', label: 'Companies', icon: Building2 },
+            { href: '/branch-admin/applicants', label: 'Applicants', icon: Contact },
             { href: '/branch-admin/jobs', label: 'Jobs', icon: Briefcase },
             { href: '/branch-admin/staff', label: 'Staff', icon: Users },
             { href: '/branch-admin/settings', label: 'Branch settings', icon: SlidersHorizontal },
@@ -75,14 +80,37 @@ export function navigationFor(role: Role): { title?: string; items: NavItemConfi
         {
           items: [
             overview,
-            { href: '/verifier/queue', label: 'Verification queue', icon: CheckSquare },
+            { href: '/verifier/companies', label: 'Companies', icon: Building2 },
+            { href: '/verifier/jobs', label: 'Jobs', icon: Briefcase },
           ],
         },
       ];
     case 'STAFF':
       return [
         {
-          items: [overview, { href: '/staff/applicants', label: 'Applicants', icon: Contact }],
+          items: [
+            overview,
+            { href: '/staff/applicants', label: 'Applicants', icon: Contact },
+            { href: '/staff/jobs', label: 'Jobs', icon: Briefcase },
+          ],
+        },
+      ];
+    case 'INTERVIEWER_SCHEDULER':
+      return [
+        {
+          items: [
+            overview,
+            {
+              href: '/interviewer-scheduler/interviews',
+              label: 'Interviews',
+              icon: Calendar,
+            },
+            {
+              href: '/interviewer-scheduler/applicants',
+              label: 'Applicants',
+              icon: Contact,
+            },
+          ],
         },
       ];
     case 'APPLICANT':
@@ -90,7 +118,10 @@ export function navigationFor(role: Role): { title?: string; items: NavItemConfi
         {
           items: [
             overview,
-            { href: '/applicant/profile', label: 'My profile', icon: UserRound },
+            { href: '/applicant/jobs', label: 'Job Matches', icon: Briefcase },
+            { href: '/applicant/progress', label: 'My Progress', icon: TrendingUp },
+            { href: '/applicant/notifications', label: 'Notifications', icon: Bell },
+            { href: '/applicant/profile', label: 'My Profile', icon: UserRound },
             { href: '/applicant/documents', label: 'Documents', icon: FileText },
           ],
         },
@@ -101,7 +132,12 @@ export function navigationFor(role: Role): { title?: string; items: NavItemConfi
           items: [
             overview,
             { href: '/employer/company', label: 'Company', icon: Building2 },
-            { href: '/employer/jobs', label: 'Jobs', icon: Briefcase },
+            // No visible jobs (own postings or referrals) → no Jobs section.
+            ...(opts.hideEmployerJobs
+              ? []
+              : [{ href: '/employer/jobs', label: 'Jobs', icon: Briefcase }]),
+            // Referrals entry removed 2026-11-12 (Act of employer removed):
+            // employers no longer see or decide referred candidates.
           ],
         },
       ];

@@ -2,6 +2,7 @@ import 'server-only';
 import { schema, type GeoPoint } from '@jobbank/db';
 import {
   computeCompleteness,
+  missingApplicantDocumentRequirements,
   MASTER_DATA_META,
   type ApplicantDocumentStatus,
   type ApplicantStatus,
@@ -20,12 +21,12 @@ import type { CommandScope, RequestContext } from '@/domains/shared/audit';
 import { NotFoundError } from '@/domains/shared/errors';
 import type { Actor } from '@/domains/shared/scope';
 import { db, type DbExecutor } from '@/lib/db';
-import { applicantMachine } from './machine';
 
 export type SignedIn = RequestContext & { actor: Actor };
 
 export const a = schema.applicants;
 export const addr = schema.applicantAddresses;
+export const permAddr = schema.applicantPermanentAddresses;
 export const edu = schema.applicantEducation;
 export const exp = schema.applicantExperience;
 export const skl = schema.applicantSkills;
@@ -34,6 +35,8 @@ export const cert = schema.applicantCertifications;
 export const pref = schema.applicantPreferences;
 export const docs = schema.applicantDocuments;
 export const idv = schema.identityVerifications;
+
+export { createRegistrationReference } from './registration-reference';
 
 export type ApplicantRow = typeof a.$inferSelect;
 
@@ -63,6 +66,9 @@ export interface ApplicantDocumentView {
 
 export interface ApplicantProfile {
   id: string;
+  registrationReference: string;
+  registrationSource: 'SELF_SERVICE' | 'STAFF_ASSISTED';
+  registeredAt: string;
   status: ApplicantStatus;
   identityStatus: IdentityStatus;
   /** What staff wrote when the identity check failed (so the applicant can fix it). */
@@ -83,8 +89,17 @@ export interface ApplicantProfile {
     addressLine: string;
     cityCode: string;
     areaCode: string | null;
-    location: GeoPoint;
+    /** Map pin; null when none was collected (staff registrations since 2026-11-16). */
+    location: GeoPoint | null;
   } | null;
+  /** Permanent home address (section 5); null when not collected. */
+  permanentAddress: {
+    addressLine: string;
+    cityCode: string;
+    areaCode: string | null;
+  } | null;
+  /** Free-text notes (section 6); null when none were recorded. */
+  additionalNotes: string | null;
   education: {
     levelCode: string;
     institution: string | null;
@@ -112,12 +127,17 @@ export interface ApplicantProfile {
     issuedMonth: string | null;
     expiresMonth: string | null;
   }[];
+  /** Stable IDs let staff update or explicitly remove records without replacing the lists. */
+  recordIds: {
+    education: string[];
+    experience: string[];
+    certifications: string[];
+  };
   preferences: {
     categoryCodes: string[];
     minSalaryPkr: number | null;
     shifts: Shift[];
     jobTypes: JobType[];
-    willingRadiusM: number | null;
     availableFrom: string | null;
   } | null;
   /** Current documents (newest first); replaced and unconfirmed uploads are left out. */
@@ -127,6 +147,10 @@ export interface ApplicantProfile {
   identityLocked: boolean;
   /** Only staff can move an activated profile to another branch. */
   branchLocked: boolean;
+  /** When the first-counter paper form was verified and signed (null until then). */
+  registrationVerifiedSignedAt: string | null;
+  /** Who recorded the verified & signed mark (user id, null until then). */
+  registrationVerifiedSignedBy: string | null;
   activatedAt: string | null;
   createdAt: string;
 }
@@ -135,7 +159,8 @@ const toMonth = (value: string | null) => (value ? value.slice(0, 7) : null);
 export const fromMonth = (value: string | null) => (value ? `${value}-01` : null);
 
 export const identityLocked = (row: ApplicantRow) => row.identityStatus === 'VERIFIED';
-export const branchLocked = (row: ApplicantRow) => row.status !== 'DRAFT';
+/** Only staff can move a profile to another branch once one is set. */
+export const branchLocked = (row: ApplicantRow) => row.branchId !== null;
 
 // ─── Loading ───────────────────────────────────────────────────────────
 
@@ -235,7 +260,57 @@ export function toDocumentView(row: typeof docs.$inferSelect): ApplicantDocument
 export async function completenessFor(
   executor: DbExecutor,
   row: ApplicantRow,
+  preloaded?: CompletenessPreload,
 ): Promise<Completeness> {
+  const inputs = preloaded ?? (await loadCompletenessInputs(executor, row));
+  const applicantCategories = new Set(inputs.preferenceCategories);
+  // Audit 2026-11-10 (A-H2): a REJECTED document must not satisfy
+  // completeness — a profile whose only CNIC evidence was rejected could
+  // otherwise REACTIVATE. REJECTED docs stay visible in currentDocuments
+  // (staff/applicant can still view the rejection), they just no longer
+  // count as "present" for the completeness guard.
+  const presentTypes = new Set(
+    inputs.presentDocuments.filter((d) => d.status !== 'REJECTED').map((d) => d.typeCode),
+  );
+  const missingRequiredDocuments = missingApplicantDocumentRequirements(
+    inputs.documentTypes.filter((t) => t.isActive).map((t) => ({ code: t.code, ...t.meta })),
+    applicantCategories,
+    presentTypes,
+  );
+
+  return computeCompleteness({
+    hasPersonal: true,
+    hasLocation: inputs.hasAddress && row.branchId !== null,
+    skillCount: inputs.skillCount,
+    educationCount: inputs.educationCount,
+    experienceCount: inputs.experienceCount,
+    hasNoExperience: row.hasNoExperience,
+    hasPreferences: inputs.preferenceCategories.length > 0,
+    missingRequiredDocuments,
+    languageCount: inputs.languageCount,
+  });
+}
+
+/**
+ * Inputs completeness needs, already fetched by the caller (buildProfile loads
+ * every one of these rows anyway). Pass them in to avoid re-querying; when
+ * omitted, completenessFor fetches them itself (refreshProfileState, REACTIVATE).
+ */
+export interface CompletenessPreload {
+  hasAddress: boolean;
+  preferenceCategories: string[];
+  educationCount: number;
+  experienceCount: number;
+  skillCount: number;
+  languageCount: number;
+  documentTypes: ApplicantDocumentType[];
+  presentDocuments: (typeof docs.$inferSelect)[];
+}
+
+async function loadCompletenessInputs(
+  executor: DbExecutor,
+  row: ApplicantRow,
+): Promise<CompletenessPreload> {
   const countOf = async (table: typeof edu | typeof exp | typeof skl | typeof lng) =>
     (await executor.select({ n: count() }).from(table).where(eq(table.applicantId, row.id)))[0]
       ?.n ?? 0;
@@ -255,67 +330,49 @@ export async function completenessFor(
     applicantDocumentTypes(executor),
     currentDocuments(executor, row.id),
   ]);
-  const presentTypes = new Set(present.map((d) => d.typeCode));
-  const missingRequiredDocuments = types.filter(
-    (t) => t.isActive && t.meta.required && !presentTypes.has(t.code),
-  ).length;
-
-  return computeCompleteness({
-    hasPersonal: true,
-    hasLocation: address.length > 0 && row.branchId !== null,
-    skillCount,
+  return {
+    hasAddress: address.length > 0,
+    preferenceCategories: preferences[0]?.categories ?? [],
     educationCount,
     experienceCount,
-    hasNoExperience: row.hasNoExperience,
-    hasPreferences: (preferences[0]?.categories.length ?? 0) > 0,
-    missingRequiredDocuments,
+    skillCount,
     languageCount,
-  });
+    documentTypes: types,
+    presentDocuments: present,
+  };
 }
 
 /**
- * Re-computes completeness after a change and activates a DRAFT profile as soon as the
- * activation requirements are met (owner decision: automatic, no staff step). Call at the
- * end of every command that changes the profile.
+ * Re-computes completeness after a change and stores the percent. Profiles
+ * are ACTIVE from creation (the DRAFT status was removed 2026-11-09), so
+ * there is no activation or demotion here any more: losing a location or a
+ * required document only lowers the completeness percent. Call at the end
+ * of every command that changes the profile.
  */
 export async function refreshProfileState(
   cmd: CommandScope,
   applicantId: string,
 ): Promise<{ status: ApplicantStatus; completeness: Completeness }> {
-  const { tx, audit, emit } = cmd;
+  const { tx } = cmd;
   const row = await loadApplicant(tx, applicantId);
   const completeness = await completenessFor(tx, row);
-  const changes: Partial<typeof a.$inferInsert> = {};
   if (completeness.percent !== row.profileCompleteness) {
-    changes.profileCompleteness = completeness.percent;
+    await tx.update(a).set({ profileCompleteness: completeness.percent }).where(eq(a.id, row.id));
   }
-  let status = row.status;
-  const activation = applicantMachine.check(
-    row.status,
-    'ACTIVATE',
-    { activationMissing: completeness.activationMissing },
-    'system',
-  );
-  if (activation.ok) {
-    status = activation.to;
-    changes.status = status;
-    changes.activatedAt = new Date();
-    audit({
-      action: 'applicant.activate',
-      entityType: 'applicant',
-      entityId: row.id,
-      branchId: row.branchId,
-      before: { status: row.status },
-      after: { status },
-    });
-    emit('applicant.activated', { applicantId: row.id, branchId: row.branchId! });
-  }
-  if (Object.keys(changes).length > 0) await tx.update(a).set(changes).where(eq(a.id, row.id));
-  return { status, completeness };
+  return { status: row.status, completeness };
 }
 
 // ─── Full profile ──────────────────────────────────────────────────────
 
+/**
+ * Full profile view. Query budget: 13 selects (12 sections + the DOCUMENT_TYPE
+ * master-data list) plus the caller's row load — the completeness inputs are
+ * the rows already fetched here, passed in so completenessFor does not
+ * re-query them (it used to add 8 more: address, preferences, 4 counts and a
+ * second copy of the documents). Callers that only need completeness
+ * (refreshProfileState, REACTIVATE) call completenessFor directly and it
+ * fetches what it needs.
+ */
 export async function buildProfile(
   executor: DbExecutor,
   row: ApplicantRow,
@@ -323,6 +380,7 @@ export async function buildProfile(
   const [
     [user],
     [address],
+    [permanentAddress],
     education,
     experience,
     skills,
@@ -332,13 +390,14 @@ export async function buildProfile(
     documents,
     [lastCheck],
     branch,
-    completeness,
+    documentTypes,
   ] = await Promise.all([
     executor
       .select({ phone: schema.users.phoneNumber })
       .from(schema.users)
       .where(eq(schema.users.id, row.userId)),
     executor.select().from(addr).where(eq(addr.applicantId, row.id)),
+    executor.select().from(permAddr).where(eq(permAddr.applicantId, row.id)),
     executor.select().from(edu).where(eq(edu.applicantId, row.id)).orderBy(asc(edu.sortOrder)),
     executor.select().from(exp).where(eq(exp.applicantId, row.id)).orderBy(asc(exp.sortOrder)),
     executor.select().from(skl).where(eq(skl.applicantId, row.id)).orderBy(asc(skl.skillCode)),
@@ -353,11 +412,24 @@ export async function buildProfile(
       .orderBy(desc(idv.createdAt))
       .limit(1),
     row.branchId ? getBranchContact(row.branchId, executor) : Promise.resolve(null),
-    completenessFor(executor, row),
+    applicantDocumentTypes(executor),
   ]);
+  const completeness = await completenessFor(executor, row, {
+    hasAddress: address !== undefined,
+    preferenceCategories: preferences?.categoryCodes ?? [],
+    educationCount: education.length,
+    experienceCount: experience.length,
+    skillCount: skills.length,
+    languageCount: languages.length,
+    documentTypes,
+    presentDocuments: documents,
+  });
 
   return {
     id: row.id,
+    registrationReference: row.registrationReference,
+    registrationSource: row.registrationSource,
+    registeredAt: row.registeredAt.toISOString(),
     status: row.status,
     identityStatus: row.identityStatus,
     identityNote:
@@ -382,6 +454,14 @@ export async function buildProfile(
           location: address.location,
         }
       : null,
+    permanentAddress: permanentAddress
+      ? {
+          addressLine: permanentAddress.addressLine,
+          cityCode: permanentAddress.cityCode,
+          areaCode: permanentAddress.areaCode,
+        }
+      : null,
+    additionalNotes: row.additionalNotes,
     education: education.map((e) => ({
       levelCode: e.levelCode,
       institution: e.institution,
@@ -411,13 +491,17 @@ export async function buildProfile(
       issuedMonth: toMonth(c.issuedMonth),
       expiresMonth: toMonth(c.expiresMonth),
     })),
+    recordIds: {
+      education: education.map((e) => e.id),
+      experience: experience.map((e) => e.id),
+      certifications: certifications.map((c) => c.id),
+    },
     preferences: preferences
       ? {
           categoryCodes: preferences.categoryCodes,
           minSalaryPkr: preferences.minSalaryPkr,
           shifts: preferences.shifts as Shift[],
           jobTypes: preferences.jobTypes as JobType[],
-          willingRadiusM: preferences.willingRadiusM,
           availableFrom: preferences.availableFrom,
         }
       : null,
@@ -425,6 +509,8 @@ export async function buildProfile(
     completeness,
     identityLocked: identityLocked(row),
     branchLocked: branchLocked(row),
+    registrationVerifiedSignedAt: row.registrationVerifiedSignedAt?.toISOString() ?? null,
+    registrationVerifiedSignedBy: row.registrationVerifiedSignedBy,
     activatedAt: row.activatedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
   };

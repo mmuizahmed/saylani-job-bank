@@ -81,6 +81,47 @@ export async function enforceRateLimit(
   if (!result.allowed) throw new RateLimitedError(result.retryAfterSeconds, message);
 }
 
+/**
+ * IP-bucketed rate limiting that fails CLOSED: when no trustworthy IP could be
+ * determined (see lib/http/client-ip.ts — no proxy in front, or the X-Forwarded-For
+ * chain is shorter than TRUSTED_PROXY_HOPS), the request must not silently escape
+ * limiting the way the old `if (ctx.ip) await enforceRateLimit(...)` pattern did.
+ * Denying outright would break direct local connections (dev has no proxy), so all
+ * such requests share one strict bucket ('untrusted') under the same rule instead
+ * of getting a free pass. In production the app always sits behind its proxies, so
+ * the shared bucket is only reached by requests that bypassed them.
+ *
+ * N17 (2026-11-08): this used to be a NOTE saying domains/auth/service.ts
+ * still had its own local rateLimitByIp that skipped when ctx.ip was null.
+ * That is stale — auth/service.ts now routes its IP limits through this
+ * helper (rateLimitByIp → enforceRateLimitByIp), so a null IP lands in the
+ * shared 'untrusted' bucket on those endpoints. Remaining `if (ctx.ip)`
+ * skips live elsewhere, not here: employer-signup.ts (signup-code-ip,
+ * signup-ip), two-factor.ts (2fa-confirm-ip) and account-tokens.ts
+ * (invite-accept-ip, password-reset-ip, password-reset-confirm-ip) still
+ * skip limiting when no IP is known — switch those to this helper too
+ * before calling the null-IP hole closed app-wide.
+ */
+export async function enforceRateLimitByIp(
+  ip: string | null,
+  name: string,
+  rule: RateLimitRule,
+  message?: string,
+): Promise<void> {
+  // Audit 2026-11-11 (M-18): a null IP in production means the proxy chain
+  // is misconfigured (TRUSTED_PROXY_HOPS wrong) or the request bypassed the
+  // proxies — every such user shares one bucket, so say so loudly. Outright
+  // rejection is a deployment decision (see fix log): once the proxies are
+  // confirmed, reject instead of sharing the bucket.
+  if (ip === null && process.env.NODE_ENV === 'production') {
+    logger.error(
+      'rate limit: no trustworthy IP in production — requests share the untrusted bucket; check TRUSTED_PROXY_HOPS',
+      { name },
+    );
+  }
+  await enforceRateLimit(name, ip ?? 'untrusted', rule, message);
+}
+
 /** Test helper. */
 export function resetMemoryRateLimits(): void {
   memory.clear();

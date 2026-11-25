@@ -15,12 +15,15 @@ export const PERMISSIONS = {
   'master_data:manage': 'Manage master data lists',
 
   'company:read': 'View companies',
-  'company:register': 'Register and edit own company',
+  'company:register': 'Register own company and edit it while it is still un-verified',
+  /** Field-visit onboarding: a staff member registers a company they approached. */
+  'company:onboard': 'Register a company on behalf of an employer after a field visit',
   'company:verify': 'Verify, reject or request info for companies',
   'company:suspend': 'Suspend or reinstate verified companies',
   'company:manage': 'Correct locked company details, transfer companies, assign verifiers',
 
   'applicant:read': 'View applicant profiles',
+  'applicant:create': 'Register applicants on behalf of job seekers',
   'applicant:self': 'Manage own applicant profile',
   'applicant:verify_identity': 'Verify applicant identity documents',
   'applicant:manage': 'Correct applicant records, change phone numbers, deactivate profiles',
@@ -29,13 +32,18 @@ export const PERMISSIONS = {
   'job:read': 'View jobs',
   'job:manage': 'Post and manage jobs for branch companies',
   'job:manage_own': "Post and manage own company's jobs",
+  /** Staff shares a job (vacancy) with a specific applicant. */
+  'job:refer': 'Refer jobs to applicants',
 
   'match_case:read': 'View match cases',
   'match_case:manage': 'Create, review and progress match cases',
   'match_case:refer': 'Refer eligible candidates to employers',
 
   'interview:schedule_jobbank': 'Schedule and record Job Bank interviews',
-  'interview:schedule_employer': 'Schedule and record employer interviews',
+
+  /** 0052 — record what happened in a scheduled Job Bank interview:
+      attendance (Attended / No-show), result (Passed / Failed) and feedback. */
+  'interview:record_outcome': 'Record a Job Bank interview outcome',
 
   'decision:employer': 'Hold / select / reject referred candidates',
   'decision:applicant': 'Accept / refuse / counteroffer own offers',
@@ -66,8 +74,13 @@ export const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
     'settings:manage',
     'master_data:manage',
     'company:read',
+    'company:onboard',
     'company:manage',
+    'company:suspend',
     'applicant:read',
+    'applicant:create',
+    'applicant:verify_identity',
+    'applicant:manage',
     'applicant:transfer',
     'job:read',
     'match_case:read',
@@ -81,40 +94,78 @@ export const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
     'user:manage',
     'settings:manage',
     'company:read',
+    'company:onboard',
     'company:manage',
+    'company:verify',
     'company:suspend',
     'applicant:read',
+    'applicant:create',
+    'applicant:verify_identity',
     'applicant:manage',
     'applicant:transfer',
     'job:read',
     'job:manage',
+    'job:refer',
     'match_case:read',
+    'match_case:manage',
+    'match_case:refer',
+    'interview:schedule_jobbank',
+    'interview:record_outcome',
+    'placement:manage',
     'blacklist:request',
     'blacklist:decide',
     'audit:read',
     'report:read',
   ],
-  VERIFIER: ['branch:read', 'company:read', 'company:verify', 'blacklist:request'],
+  VERIFIER: [
+    'branch:read',
+    'company:read',
+    'company:onboard',
+    'company:manage',
+    'job:read',
+    'job:manage',
+    'blacklist:request',
+  ],
   STAFF: [
     'branch:read',
     'company:read',
     'applicant:read',
+    'applicant:create',
     'applicant:verify_identity',
     'applicant:manage',
     'job:read',
+    /** Staff post jobs for verified companies in their city scope (entry
+        points workstream): staffCreateJob still enforces VERIFIED + scope. */
+    'job:manage',
+    'job:refer',
     'match_case:read',
     'match_case:manage',
     'match_case:refer',
     'interview:schedule_jobbank',
+    'interview:record_outcome',
     'placement:manage',
     'blacklist:request',
+  ],
+  /** One combined role (2026-11-12), end-to-end for the Job Bank interview
+      stage (Option B, 0052): schedules Job Bank interviews, records their
+      outcomes, and refers candidates he passed to the employer. He still
+      cannot shortlist (match_case:manage), manage jobs/companies/staff,
+      or decide for employers — and his referral is pass-only, enforced in
+      referApplicantToEmployer, not just by this list. */
+  INTERVIEWER_SCHEDULER: [
+    'branch:read',
+    'applicant:read',
+    'job:read',
+    'match_case:read',
+    'match_case:refer',
+    'interview:schedule_jobbank',
+    'interview:record_outcome',
   ],
   EMPLOYER: [
     'company:register',
     'job:read',
     'job:manage_own',
     'match_case:read',
-    'interview:schedule_employer',
     'decision:employer',
     'blacklist:request',
   ],
@@ -131,6 +182,7 @@ export const ROLE_HOME: Record<Role, string> = {
   BRANCH_ADMIN: '/branch-admin',
   VERIFIER: '/verifier',
   STAFF: '/staff',
+  INTERVIEWER_SCHEDULER: '/interviewer-scheduler',
   EMPLOYER: '/employer',
   APPLICANT: '/applicant',
 };
@@ -140,6 +192,7 @@ export const ROLE_PRIORITY: readonly Role[] = [
   'BRANCH_ADMIN',
   'VERIFIER',
   'STAFF',
+  'INTERVIEWER_SCHEDULER',
   'EMPLOYER',
   'APPLICANT',
 ];

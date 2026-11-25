@@ -3,7 +3,9 @@
 import { AlertDialog } from 'radix-ui';
 import { useState } from 'react';
 import { Button } from '@/components/atoms/Button';
+import { Input } from '@/components/atoms/Input';
 import { Textarea } from '@/components/atoms/Textarea';
+import { ErrorBanner } from '../ErrorBanner';
 import { FormField } from '../FormField';
 import type { ConfirmDialogProps } from './confirmDialog.types';
 
@@ -15,6 +17,7 @@ export function ConfirmDialog({
   cancelLabel = 'Cancel',
   tone = 'primary',
   requireReason,
+  requirePassword,
   onConfirm,
   trigger,
   open: controlledOpen,
@@ -23,16 +26,19 @@ export function ConfirmDialog({
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
   const open = controlledOpen ?? uncontrolledOpen;
   const [reason, setReason] = useState('');
+  const [password, setPassword] = useState('');
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   const minLength = requireReason?.minLength ?? 1;
   const reasonOk = !requireReason || reason.trim().length >= minLength;
+  const passwordOk = !requirePassword || password.length > 0;
 
   const setOpen = (next: boolean) => {
     if (pending) return;
     if (!next) {
       setReason('');
+      setPassword('');
       setError(null);
     }
     setUncontrolledOpen(next);
@@ -40,16 +46,22 @@ export function ConfirmDialog({
   };
 
   const confirm = async () => {
-    if (!reasonOk) return;
+    if (!reasonOk || !passwordOk) return;
     setPending(true);
     setError(null);
     try {
-      await onConfirm(requireReason ? reason.trim() : undefined);
+      // Callers without requirePassword see exactly the old one-argument
+      // call; the password is only passed when the dialog asked for it.
+      if (requirePassword) {
+        await onConfirm(requireReason ? reason.trim() : undefined, password);
+      } else {
+        await onConfirm(requireReason ? reason.trim() : undefined);
+      }
       setPending(false);
       setOpen(false);
     } catch (err) {
       setPending(false);
-      setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.');
+      setError(err);
     }
   };
 
@@ -72,6 +84,18 @@ export function ConfirmDialog({
 
           {children}
 
+          {requirePassword && (
+            <FormField label={requirePassword.label ?? 'Your password'} required>
+              <Input
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                placeholder="Re-enter your password to confirm"
+                onChange={(event) => setPassword(event.target.value)}
+              />
+            </FormField>
+          )}
+
           {requireReason && (
             <FormField
               label={requireReason.label}
@@ -87,14 +111,7 @@ export function ConfirmDialog({
             </FormField>
           )}
 
-          {error && (
-            <p
-              role="alert"
-              className="bg-danger-soft text-danger-soft-fg rounded-lg px-3 py-2 text-sm"
-            >
-              {error}
-            </p>
-          )}
+          <ErrorBanner error={error ?? undefined} operation="Confirm" />
 
           <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
             <AlertDialog.Cancel asChild>
@@ -106,7 +123,7 @@ export function ConfirmDialog({
             <Button
               variant={tone === 'danger' ? 'danger' : 'primary'}
               loading={pending}
-              disabled={!reasonOk}
+              disabled={!reasonOk || !passwordOk}
               onClick={() => void confirm()}
             >
               {confirmLabel}

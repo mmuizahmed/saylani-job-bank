@@ -1,8 +1,10 @@
+import { timingSafeEqual } from 'node:crypto';
 import { HEADERS, type Permission, type Role } from '@jobbank/shared';
 import type { z } from 'zod';
 import { env } from '@/lib/env';
+import { clientIpFrom } from '@/lib/http/client-ip';
 import { resolveCorrelationId } from '@/lib/http/correlation';
-import { logger } from '@/lib/logger';
+import { logger, type Logger } from '@/lib/logger';
 import { recordAudit, type RequestContext } from '../audit';
 import {
   BadRequestError,
@@ -22,6 +24,7 @@ import {
 import { searchParamsToObject } from '../pagination';
 import { hasPermission, hasRole, type Actor } from '../scope';
 import { resolveActor } from './actor';
+import { resolveOnBehalfActor } from './on-behalf';
 import type { HandlerResult } from './responses';
 
 type AnySchema = z.ZodType;
@@ -49,8 +52,8 @@ export interface ApiHandlerOptions<
   /** Permission gate. Ownership + branch scope are still checked in domain services. */
   permission?: Permission;
   /**
-   * Allow actors who must still enrol two-factor authentication (Super Admin / Branch
-   * Admin before setup). Only for the endpoints needed to finish setup or sign out.
+   * Allow actors who must still enrol two-factor authentication (a 2FA-required
+   * role before setup). Only for the endpoints needed to finish setup or sign out.
    */
   allowTwoFactorPending?: boolean;
   body?: BS;
@@ -61,6 +64,8 @@ export interface ApiHandlerOptions<
    * an unexpected field fails the request instead of leaking (PRD rule 3).
    */
   output?: AnySchema;
+  /** Staff may call this job seeker route for a counter-registered candidate (see on-behalf.ts). */
+  onBehalf?: boolean;
   /** Require an Idempotency-Key header and replay duplicates (PRD §8). */
   idempotent?: boolean;
   maxBodyBytes?: number;
@@ -90,30 +95,109 @@ export const handlerDeps: { idempotencyStore: IdempotencyStore } = {
 
 const UNSAFE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
+// Keep in sync with apps/web/src/middleware.ts.
+const SESSION_COOKIE_NAMES = ['jb.session_token', '__Secure-jb.session_token'];
+
 /**
- * CSRF defence for cookie-authenticated writes: browsers always send Origin (and
- * Sec-Fetch-Site) on cross-site requests, so an unsafe request from a foreign origin is
- * refused. Non-browser clients (no Origin header) are unaffected.
+ * CSRF defence for cookie-authenticated writes.
+ *
+ * Browsers always send Origin on unsafe (POST/PUT/PATCH/DELETE) requests, and always
+ * send Sec-Fetch-Site. Origin is the authoritative signal — a cross-site page cannot
+ * forge it (it is a forbidden header name), so a request whose Origin is this app is
+ * genuine however Sec-Fetch-Site classifies it. That matters for LAN access: when the
+ * app is reached by its LAN IP (e.g. a phone on http://192.168.0.150:3000) while the
+ * configured app URL is still http://localhost:3000, Chrome can report
+ * Sec-Fetch-Site: cross-site for the same-origin fetch, and blocking on that header
+ * first locked every phone sign-in out with "Cross-site request blocked". So, for
+ * unsafe methods:
+ * - Origin present → it must be this app (same-origin or the configured app URL).
+ *   A matching Origin passes even if Sec-Fetch-Site says cross-site.
+ * - Origin absent and Sec-Fetch-Site: cross-site → refuse.
+ * - Origin absent but Referer present → the Referer origin must be this app
+ *   (covers older browsers that send no Origin on same-origin POSTs).
+ * - Origin absent, Referer absent, Sec-Fetch-Site present → a browser request with
+ *   its Origin stripped (proxy) or forged → refuse and log it. A page cannot
+ *   suppress these headers: both are forbidden header names, so a cross-site page
+ *   cannot hide that the request came from a browser.
+ * - Neither Origin, Referer nor Sec-Fetch-Site → not a browser at all. The app's
+ *   supported non-browser callers (in-process test harnesses, the Playwright
+ *   global-setup warm-up, load-test scripts, curl) send no Origin and are allowed
+ *   by design; if such a request carries a session cookie it is logged, so
+ *   cookie-bearing non-browser traffic stays visible instead of silently passing.
+ * The old behaviour (`if (!origin) return`) failed open for every browser request
+ * that omitted Origin; this closes that hole without breaking the non-browser
+ * clients above.
  */
-function assertSameOrigin(request: Request, url: URL): void {
+function assertSameOrigin(request: Request, url: URL, log: Logger): void {
   if (!UNSAFE_METHODS.has(request.method)) return;
-  if (request.headers.get('sec-fetch-site') === 'cross-site') {
-    throw new ForbiddenError('Cross-site request blocked');
-  }
-  const origin = request.headers.get('origin');
-  if (!origin) return;
   const allowed = new Set([url.origin]);
   try {
     allowed.add(new URL(env.NEXT_PUBLIC_APP_URL).origin);
   } catch {
     // App URL not configured (some test setups): the same-origin check still applies.
   }
-  if (!allowed.has(origin)) throw new ForbiddenError('Cross-site request blocked');
+  const origin = request.headers.get('origin');
+  if (origin) {
+    if (!allowed.has(origin)) throw new ForbiddenError('Cross-site request blocked');
+    return;
+  }
+  const fetchSite = request.headers.get('sec-fetch-site');
+  if (fetchSite === 'cross-site') {
+    throw new ForbiddenError('Cross-site request blocked');
+  }
+  const referer = request.headers.get('referer');
+  if (referer) {
+    let refererOrigin: string | null = null;
+    try {
+      refererOrigin = new URL(referer).origin;
+    } catch {
+      refererOrigin = null;
+    }
+    if (!refererOrigin || !allowed.has(refererOrigin)) {
+      throw new ForbiddenError('Cross-site request blocked');
+    }
+    return;
+  }
+  if (fetchSite) {
+    log.warn('blocked browser write without origin', {
+      method: request.method,
+      path: url.pathname,
+      fetchSite,
+    });
+    throw new ForbiddenError('Cross-site request blocked');
+  }
+  const cookie = request.headers.get('cookie') ?? '';
+  if (SESSION_COOKIE_NAMES.some((name) => cookie.includes(`${name}=`))) {
+    // Audit 2026-11-11 (L-13): in production an origin-less write carrying
+    // a session cookie is blocked — CSRF protection must not rest on
+    // browsers always sending Origin. The only production escape is the
+    // explicit non-browser credential (x-internal-write-token, set via
+    // INTERNAL_WRITE_TOKEN) for unattended automation. Test and development
+    // keep the lenient path: test harnesses, Playwright warm-up and curl
+    // send no Origin by design, and dev carries no production data.
+    if (env.NODE_ENV === 'production' && !hasInternalWriteToken(request)) {
+      log.warn('blocked origin-less cookie-authenticated write in production', {
+        method: request.method,
+        path: url.pathname,
+      });
+      throw new ForbiddenError('Cross-site request blocked');
+    }
+    log.warn('origin-less cookie-authenticated write from a non-browser client', {
+      method: request.method,
+      path: url.pathname,
+    });
+  }
 }
 
-function clientIp(request: Request): string | null {
-  const forwarded = request.headers.get('x-forwarded-for');
-  return forwarded?.split(',')[0]?.trim() || request.headers.get('x-real-ip') || null;
+/** Explicit non-browser credential for unattended automation (L-13). */
+function hasInternalWriteToken(request: Request): boolean {
+  const expected = env.INTERNAL_WRITE_TOKEN;
+  if (!expected) return false;
+  const presented = request.headers.get('x-internal-write-token');
+  if (!presented) return false;
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 function parseWith<S extends AnySchema>(schema: S, value: unknown, label: string): z.infer<S> {
@@ -181,13 +265,13 @@ export function apiHandler<
     let status = 500;
 
     try {
-      assertSameOrigin(request, url);
+      assertSameOrigin(request, url, log);
       actor = await resolveActor(request);
       ctx = {
         actor,
         system: false,
         correlationId,
-        ip: clientIp(request),
+        ip: clientIpFrom(request.headers),
         userAgent: request.headers.get('user-agent'),
         log: log.child({ actorId: actor?.userId }),
       };
@@ -197,6 +281,16 @@ export function apiHandler<
         throw new ForbiddenError('Set up two-factor authentication to continue', {
           reason: 'TWO_FACTOR_SETUP_REQUIRED',
         });
+      }
+      // On-behalf resolution happens before the role/permission gates, so those
+      // gates are checked against the resolved actor (the candidate, or the
+      // synthesised employer actor) — never against the staff member's own roles.
+      const onBehalfOf = options.onBehalf ? request.headers.get(HEADERS.onBehalfOf) : null;
+      if (onBehalfOf && actor) {
+        const staff = actor;
+        actor = await resolveOnBehalfActor(staff, onBehalfOf);
+        ctx.actor = actor;
+        ctx.enteredBy = staff;
       }
       if (options.roles && (!actor || !hasRole(actor, ...options.roles))) {
         throw new ForbiddenError();

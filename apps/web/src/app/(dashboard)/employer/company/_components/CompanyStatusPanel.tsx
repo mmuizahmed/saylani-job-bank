@@ -6,11 +6,11 @@ import {
   COMPANY_SIZE_LABELS,
   type CompanyStatus,
 } from '@jobbank/shared';
-import { Building2, CheckCircle2, XCircle, AlertCircle, Clock } from 'lucide-react';
-import NextLink from 'next/link';
-import { Button, StatusPill } from '@/components/atoms';
+import { CheckCircle2, XCircle, AlertCircle, Clock, PlusCircle } from 'lucide-react';
+import { Button, Link, StatusPill } from '@/components/atoms';
 import { KeyValue } from '@/components/molecules';
 import type { CompanyView } from '@/domains/company';
+import { formatDate } from '@/lib/format/date';
 
 const STATUS_PILL: Record<
   CompanyStatus,
@@ -40,10 +40,18 @@ export function CompanyStatusPanel({ company }: { company: CompanyView }) {
           )}
         </div>
         <div className="flex items-center gap-2">
+          {company.status === 'VERIFIED' && (
+            <Link href="/employer/jobs/new">
+              <Button size="sm">
+                <PlusCircle className="mr-1.5 size-4" />
+                Post a job
+              </Button>
+            </Link>
+          )}
           <StatusPill
             label={
               company.status === 'VERIFIED' && company.verifiedAt
-                ? `Verified · ${new Date(company.verifiedAt).toLocaleDateString('en-PK')}`
+                ? `Verified · ${formatDate(company.verifiedAt)}`
                 : pill.label
             }
             tone={pill.variant}
@@ -93,9 +101,7 @@ export function CompanyStatusPanel({ company }: { company: CompanyView }) {
                   <span className="text-fg">{COMPANY_STATUS_LABELS[company.status]}</span>
                   {ver.infoRequest && <p className="text-fg-muted">{ver.infoRequest}</p>}
                   {ver.decisionNote && <p className="text-fg-muted">{ver.decisionNote}</p>}
-                  <span className="text-fg-subtle text-xs">
-                    Due {new Date(ver.slaDueOn).toLocaleDateString('en-PK')}
-                  </span>
+                  <span className="text-fg-subtle text-xs">Due {formatDate(ver.slaDueOn)}</span>
                 </div>
               </li>
             ))}
@@ -103,11 +109,14 @@ export function CompanyStatusPanel({ company }: { company: CompanyView }) {
         </section>
       )}
 
-      <div className="flex">
-        <Button asChild variant="secondary" leftIcon={<Building2 />}>
-          <NextLink href="/employer/company?step=details">Edit details</NextLink>
-        </Button>
-      </div>
+      {/* Read-only: the employer cannot edit company details from here. Verified
+          details stay as verified; anything waiting with a verifier stays as
+          submitted. Corrections go through Job Bank staff. */}
+      <p className="text-fg-muted text-sm">
+        {company.status === 'VERIFIED' || company.status === 'SUSPENDED'
+          ? 'These details were verified by Saylani Job Bank and can’t be changed here. To correct them, contact your Job Bank branch.'
+          : 'Your company is with a verifier, so these details can’t be changed here right now. If they ask for more information, you’ll be able to update them then.'}
+      </p>
     </div>
   );
 }

@@ -1,10 +1,14 @@
 import { schema } from '@jobbank/db';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { GET as getApplicant, PATCH as staffPatch } from '@/app/api/v1/applicants/[id]/route';
+import { POST as markVerifiedSigned } from '@/app/api/v1/applicants/[id]/registration-form/verified-signed/route';
 import { GET as staffDocUrl } from '@/app/api/v1/applicants/[id]/documents/[docId]/url/route';
+import { GET as staffDocDownload } from '@/app/api/v1/applicants/[id]/documents/[docId]/download/route';
+import { PUT as uploadDoc } from '@/app/api/v1/applicants/me/documents/[id]/upload/route';
 import { POST as verifyIdentity } from '@/app/api/v1/applicants/[id]/identity-verification/route';
 import { PUT as changePhone } from '@/app/api/v1/applicants/[id]/phone/route';
+import { POST as requestPhoneCode } from '@/app/api/v1/applicants/[id]/phone/code/route';
 import { PATCH as staffStatus } from '@/app/api/v1/applicants/[id]/status/route';
 import { POST as transfer } from '@/app/api/v1/applicants/[id]/transfer/route';
 import { GET as branchOptions } from '@/app/api/v1/applicants/me/branch-options/route';
@@ -18,14 +22,16 @@ import { GET as getMe, PATCH as patchMe } from '@/app/api/v1/applicants/me/route
 import { PUT as putSkills } from '@/app/api/v1/applicants/me/skills/route';
 import { PATCH as myStatus } from '@/app/api/v1/applicants/me/status/route';
 import { POST as register } from '@/app/api/v1/applicants/register/route';
-import { GET as listApplicants } from '@/app/api/v1/applicants/route';
+import { GET as listApplicants, POST as staffRegister } from '@/app/api/v1/applicants/route';
 import { resetMemoryRateLimits } from '@/domains/shared/rate-limit';
 import { db } from '@/lib/db';
+import { devOutbox } from '@/lib/sms/sms';
 import {
+  BASE,
   call,
   owner,
   randomPhone,
-  signIn,
+  signInWith2fa,
   signInAdmin,
   signInApplicant,
   type Jar,
@@ -48,10 +54,19 @@ const branchId = async (code: string) =>
 
 let khi: string;
 let lhr: string;
+let staffJar: Jar;
+let staffUserId: string;
 
 beforeAll(async () => {
   khi = await branchId('KHI-GULSHAN');
   lhr = await branchId('LHR-JOHAR');
+  staffJar = await signInWith2fa('staff.khi@jobbank.local');
+  staffUserId = (
+    await db
+      .select({ id: schema.users.id })
+      .from(schema.users)
+      .where(eq(schema.users.email, 'staff.khi@jobbank.local'))
+  )[0]!.id;
 });
 beforeEach(() => resetMemoryRateLimits());
 
@@ -78,6 +93,117 @@ async function registered(overrides: Record<string, unknown> = {}) {
   return { jar, profile: res.body.data, cnic: body.cnic as string };
 }
 
+describe('staff-assisted applicant registration', () => {
+  async function createStaffApplicant(branchId: string, jar = staffJar) {
+    return call(staffRegister, '/api/v1/applicants', {
+      method: 'POST',
+      body: { ...personal(), phone: randomPhone(), branchId },
+      jar,
+    });
+  }
+
+  it('rejects a CNIC that is already registered', async () => {
+    const existing = await registered();
+    const response = await call(staffRegister, '/api/v1/applicants', {
+      method: 'POST',
+      body: {
+        ...personal({ cnic: existing.cnic }),
+        phone: randomPhone(),
+        branchId: khi,
+      },
+      jar: staffJar,
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('CONFLICT');
+    expect(response.body.error.details.reason).toBe('CNIC_TAKEN');
+  });
+
+  it('rejects a staff member registering an applicant outside their branch', async () => {
+    const response = await call(staffRegister, '/api/v1/applicants', {
+      method: 'POST',
+      body: { ...personal(), phone: randomPhone(), branchId: lhr },
+      jar: staffJar,
+    });
+
+    expect(response.status).toBe(403);
+  });
+
+  it('creates an ACTIVE applicant and audits the staff member who created it', async () => {
+    const body = { ...personal(), phone: randomPhone(), branchId: khi };
+    const response = await call(staffRegister, '/api/v1/applicants', {
+      method: 'POST',
+      body,
+      jar: staffJar,
+    });
+
+    expect(response.status).toBe(201);
+    expect(response.body.data.status).toBe('ACTIVE');
+    expect(response.body.data.createdByStaff).toMatchObject({
+      name: expect.any(String),
+      roleLabel: 'Job Bank Staff',
+    });
+    const applicantId = response.body.data.id as string;
+    const [applicant] = await db
+      .select({
+        status: schema.applicants.status,
+        branchId: schema.applicants.branchId,
+        userId: schema.applicants.userId,
+      })
+      .from(schema.applicants)
+      .where(eq(schema.applicants.id, applicantId));
+    const [applicantRole] = await db
+      .select({ roleCode: schema.userRoles.roleCode })
+      .from(schema.userRoles)
+      .where(eq(schema.userRoles.userId, applicant!.userId));
+    const [audit] = await db
+      .select()
+      .from(schema.auditLogs)
+      .where(
+        and(
+          eq(schema.auditLogs.action, 'applicant.register_by_staff'),
+          eq(schema.auditLogs.entityId, applicantId),
+        ),
+      );
+
+    expect(applicant).toMatchObject({ status: 'ACTIVE', branchId: khi });
+    expect(applicantRole?.roleCode).toBe('APPLICANT');
+    // Revised process: registration issues no token — the form's QR encodes the
+    // applicant ID instead. The token is issued only if a later step needs one.
+    expect(response.body.data.registrationToken).toBeUndefined();
+    expect(audit).toMatchObject({
+      actorUserId: staffUserId,
+      branchId: khi,
+      metadata: { createdBy: staffUserId },
+    });
+  });
+
+  it('marks an applicant verified & signed and audits it', async () => {
+    const created = await createStaffApplicant(khi);
+    expect(created.status).toBe(201);
+    const applicantId = created.body.data.id as string;
+    const response = await call(
+      markVerifiedSigned,
+      `/api/v1/applicants/${applicantId}/registration-form/verified-signed`,
+      { method: 'POST', jar: staffJar, params: { id: applicantId } },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.verifiedSigned).toBe(true);
+    const [audit] = await db
+      .select()
+      .from(schema.auditLogs)
+      .where(
+        and(
+          eq(schema.auditLogs.action, 'applicant.registration_form_verified_signed'),
+          eq(schema.auditLogs.entityId, applicantId),
+        ),
+      );
+    expect(audit).toBeDefined();
+    expect(audit?.metadata).toMatchObject({ verifiedBy: staffUserId });
+  });
+});
+
 const location = (branch: string) => ({
   location: KARACHI_HOME,
   addressLine: 'House 12, Block 13-D',
@@ -86,6 +212,14 @@ const location = (branch: string) => ({
   branchId: branch,
 });
 
+/** A genuine move to the Lahore branch (city code drives the auto-assign). */
+const lahoreLocation = {
+  location: { lat: 31.4697, lng: 74.2728 },
+  addressLine: 'House 12, Block G1',
+  cityCode: 'LAHORE',
+  areaCode: 'LAHORE_JOHAR_TOWN',
+};
+
 async function upload(jar: Jar, typeCode: string, bytes = PNG, contentType = 'image/png') {
   const presigned = await call(presignDoc, '/api/v1/applicants/me/documents', {
     method: 'POST',
@@ -93,8 +227,17 @@ async function upload(jar: Jar, typeCode: string, bytes = PNG, contentType = 'im
     jar,
   });
   expect(presigned.status, JSON.stringify(presigned.body)).toBe(201);
-  const { documentId, upload: put } = presigned.body.data;
-  const stored = await fetch(put.url, { method: 'PUT', headers: put.headers, body: bytes });
+  const { documentId } = presigned.body.data;
+  // Same-origin upload: the bytes go to the app's upload route, which stores
+  // them — the browser (and this test) never talks to storage directly.
+  const stored = await uploadDoc(
+    new Request(`${BASE}/api/v1/applicants/me/documents/${documentId}/upload`, {
+      method: 'PUT',
+      headers: { 'content-type': contentType, cookie: jar.header() },
+      body: bytes,
+    }),
+    { params: Promise.resolve({ id: documentId }) },
+  );
   expect(stored.status).toBe(200);
   const confirmed = await call(
     confirmDoc,
@@ -138,7 +281,7 @@ const latestAudit = async (action: string, entityId: string) =>
   )[0];
 
 describe('applicant registration', () => {
-  it('starts a DRAFT profile from the phone account and names the account', async () => {
+  it('starts an ACTIVE profile from the phone account and names the account', async () => {
     const jar = await signInApplicant(randomPhone());
     expect((await call(getMe, '/api/v1/applicants/me', { jar })).status).toBe(404);
 
@@ -154,7 +297,7 @@ describe('applicant registration', () => {
     });
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(res.body.data).toMatchObject({
-      status: 'DRAFT',
+      status: 'ACTIVE',
       identityStatus: 'UNVERIFIED',
       personal: { fullName: 'Ayesha Khan', cnic: body.cnic, email: null },
       completeness: { percent: 20, activationMissing: ['location', 'documents'] },
@@ -252,7 +395,7 @@ describe('location, branch and profile sections', () => {
     expect(stored).toMatchObject({ type: 'POINT', lat: KARACHI_HOME.lat });
   });
 
-  it('validates section codes, dates and the radius cap', async () => {
+  it('validates section codes and dates', async () => {
     const { jar } = await registered();
     await call(putLocation, '/api/v1/applicants/me/location', {
       method: 'PUT',
@@ -309,19 +452,12 @@ describe('location, branch and profile sections', () => {
       .from(schema.masterData)
       .where(eq(schema.masterData.type, 'JOB_CATEGORY'))
       .limit(1);
-    const tooFar = await call(putPreferences, '/api/v1/applicants/me/preferences', {
-      method: 'PUT',
-      body: { categoryCodes: [category!.code], shifts: [], jobTypes: [], willingRadiusM: 12000 },
-      jar,
-    });
-    expect(tooFar.status).toBe(422);
     const prefs = await call(putPreferences, '/api/v1/applicants/me/preferences', {
       method: 'PUT',
       body: {
         categoryCodes: [category!.code],
         shifts: ['DAY'],
         jobTypes: ['FULL_TIME'],
-        willingRadiusM: 6000,
         minSalaryPkr: 40000,
       },
       jar,
@@ -390,15 +526,19 @@ describe('documents and activation', () => {
     expect(confirmGhost.status).toBe(409);
   });
 
-  it('activates automatically once both CNIC sides are uploaded, then locks the branch', async () => {
+  it('is ACTIVE from registration and locks the branch once location is set', async () => {
     const { jar, profile } = await registered();
+    expect(profile.status).toBe('ACTIVE');
+    expect(profile.activatedAt).not.toBeNull();
+    expect(profile.branchLocked).toBe(false);
     await call(putLocation, '/api/v1/applicants/me/location', {
       method: 'PUT',
       body: location(khi),
       jar,
     });
     const front = await upload(jar, 'CNIC_FRONT');
-    expect(front.profile.status).toBe('DRAFT');
+    expect(front.profile.status).toBe('ACTIVE');
+    expect(front.profile.branchLocked).toBe(true);
 
     // A re-upload replaces the old front image instead of adding a second one.
     const front2 = await upload(jar, 'CNIC_FRONT');
@@ -409,11 +549,10 @@ describe('documents and activation', () => {
     const back = await upload(jar, 'CNIC_BACK');
     expect(back.profile).toMatchObject({ status: 'ACTIVE', branchLocked: true });
     expect(back.profile.activatedAt).not.toBeNull();
-    expect(await latestAudit('applicant.activate', profile.id)).toBeDefined();
 
     const moveBranch = await call(putLocation, '/api/v1/applicants/me/location', {
       method: 'PUT',
-      body: location(lhr),
+      body: lahoreLocation,
       jar,
     });
     expect(moveBranch.status).toBe(403);
@@ -446,7 +585,7 @@ describe('documents and activation', () => {
 describe('staff access', () => {
   it('scopes search and profiles to the branch, and audits denied access', async () => {
     const { profile } = await activeApplicant();
-    const khiStaff = await signIn('staff.khi@jobbank.local');
+    const khiStaff = await signInWith2fa('staff.khi@jobbank.local');
     const found = await call(
       listApplicants,
       `/api/v1/applicants?q=${profile.personal.cnic.slice(0, 9)}&status=ACTIVE`,
@@ -461,7 +600,7 @@ describe('staff access', () => {
     expect(row.cnicMasked).toContain('•');
     expect(JSON.stringify(found.body)).not.toContain(profile.personal.cnic);
 
-    const lhrStaff = await signIn('staff.lhr@jobbank.local');
+    const lhrStaff = await signInWith2fa('staff.lhr@jobbank.local');
     const denied = await call(getApplicant, `/api/v1/applicants/${profile.id}`, {
       jar: lhrStaff,
       params: { id: profile.id },
@@ -478,7 +617,7 @@ describe('staff access', () => {
     });
     expect(lhrList.body.data).toEqual([]);
 
-    const employer = await signIn('employer@jobbank.local');
+    const employer = await signInWith2fa('employer@jobbank.local');
     expect((await call(listApplicants, '/api/v1/applicants', { jar: employer })).status).toBe(403);
     expect(
       (
@@ -490,9 +629,70 @@ describe('staff access', () => {
     ).toBe(403);
   });
 
+  it('filters the staff list by city, area, area name and registration date', async () => {
+    const staff = await signInWith2fa('staff.khi@jobbank.local');
+    // Staff registration (no document upload, so this runs without the S3 dev stack);
+    // the address row is inserted directly for the same reason.
+    const created = await call(staffRegister, '/api/v1/applicants', {
+      method: 'POST',
+      body: { ...personal(), phone: randomPhone(), branchId: khi },
+      jar: staff,
+    });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const id = created.body.data.id as string;
+    await db.insert(schema.applicantAddresses).values({
+      applicantId: id,
+      addressLine: 'House 12, Block 13-D',
+      cityCode: 'KARACHI',
+      areaCode: 'KARACHI_GULSHAN_E_IQBAL',
+      location: sql`ST_SetSRID(ST_MakePoint(67.0899, 24.9256), 4326)::geography`,
+    });
+    const find = async (qs: string) =>
+      (await call(listApplicants, `/api/v1/applicants?${qs}`, { jar: staff })).body.data as {
+        id: string;
+      }[];
+    const ids = (rows: { id: string }[]) => rows.map((r) => r.id);
+
+    // City and area filters (the funnel panel exposes these; the API already accepted them).
+    expect(ids(await find('cityCode=KARACHI'))).toContain(id);
+    expect(ids(await find('cityCode=LAHORE'))).not.toContain(id);
+    expect(ids(await find('areaCode=KARACHI_GULSHAN_E_IQBAL'))).toContain(id);
+    expect(ids(await find('areaCode=LAHORE_JOHAR_TOWN'))).not.toContain(id);
+
+    // Several values for one filter (sidebar checkboxes): any ticked value matches.
+    // The new profile is ACTIVE, never INACTIVE or RESTRICTED.
+    expect(ids(await find('status=ACTIVE'))).toContain(id);
+    expect(ids(await find('status=INACTIVE&status=RESTRICTED'))).not.toContain(id);
+    expect(ids(await find('cityCode=KARACHI&cityCode=LAHORE'))).toContain(id);
+
+    // Free text matches the area label staff see, not just the code.
+    expect(ids(await find(`q=${encodeURIComponent('Gulshan')}`))).toContain(id);
+
+    // Registration date: created today (UTC) matches; from tomorrow does not.
+    const today = new Date().toISOString().slice(0, 10);
+    const tomorrow = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
+    expect(ids(await find(`createdFrom=${today}&createdTo=${today}`))).toContain(id);
+    expect(ids(await find(`createdFrom=${tomorrow}`))).not.toContain(id);
+
+    // Bad dates and a reversed range fail loudly instead of silently returning everything.
+    expect(
+      (await call(listApplicants, '/api/v1/applicants?createdFrom=not-a-date', { jar: staff }))
+        .status,
+    ).toBe(422);
+    expect(
+      (
+        await call(
+          listApplicants,
+          `/api/v1/applicants?createdFrom=${tomorrow}&createdTo=${today}`,
+          { jar: staff },
+        )
+      ).status,
+    ).toBe(422);
+  });
+
   it('verifies identity from the CNIC images, audits document views and locks identity fields', async () => {
     const { jar, profile } = await activeApplicant();
-    const staff = await signIn('staff.khi@jobbank.local');
+    const staff = await signInWith2fa('staff.khi@jobbank.local');
     const front = profile.documents.find((d: { typeCode: string }) => d.typeCode === 'CNIC_FRONT');
 
     const link = await call(
@@ -504,7 +704,13 @@ describe('staff access', () => {
       },
     );
     expect(link.status).toBe(200);
-    const image = await fetch(link.body.data.url);
+    const image = await staffDocDownload(
+      new Request(`${BASE}/api/v1/applicants/${profile.id}/documents/${front.id}/download`, {
+        headers: { cookie: staff.header() },
+      }),
+      { params: Promise.resolve({ id: profile.id, docId: front.id }) },
+    );
+    expect(image.status).toBe(200);
     expect(new Uint8Array(await image.arrayBuffer())).toEqual(PNG);
     expect(await latestAudit('applicant.document_view', profile.id)).toMatchObject({
       metadata: { documentId: front.id, typeCode: 'CNIC_FRONT' },
@@ -557,12 +763,16 @@ describe('staff access', () => {
       jar,
     });
     expect(lockedImage.status).toBe(403);
+    // Round 2: the email must be unique per run — the test DB persists, so
+    // the hardcoded address from the first proof run is already taken (409).
+    const freshEmail = `ayesha.${crypto.randomUUID().slice(0, 8)}@example.com`;
     const stillEditable = await call(patchMe, '/api/v1/applicants/me', {
       method: 'PATCH',
-      body: { email: 'ayesha@example.com' },
+      body: { email: freshEmail },
       jar,
     });
-    expect(stillEditable.body.data.personal.email).toBe('ayesha@example.com');
+    expect(stillEditable.status, JSON.stringify(stillEditable.body)).toBe(200);
+    expect(stillEditable.body.data.personal.email).toBe(freshEmail);
 
     // History is evidence: the database refuses to change it.
     await expect(
@@ -585,11 +795,23 @@ describe('staff access', () => {
 
   it('moves a profile to a new phone number and ends the old sessions', async () => {
     const { jar, profile } = await activeApplicant();
-    const staff = await signIn('staff.khi@jobbank.local');
+    const staff = await signInWith2fa('staff.khi@jobbank.local');
     const newPhone = randomPhone();
+    // M-21: the new number must prove itself first — request the 6-digit
+    // code texted to it, then spend it on the change.
+    const codeReq = await call(requestPhoneCode, `/api/v1/applicants/${profile.id}/phone/code`, {
+      method: 'POST',
+      body: { phone: newPhone },
+      jar: staff,
+      params: { id: profile.id },
+    });
+    expect(codeReq.status, JSON.stringify(codeReq.body)).toBe(200);
+    const message = [...devOutbox].reverse().find((m) => m.to === newPhone);
+    const code = message?.message.match(/\b(\d{6})\b/)?.[1];
+    expect(code).toBeDefined();
     const changed = await call(changePhone, `/api/v1/applicants/${profile.id}/phone`, {
       method: 'PUT',
-      body: { phone: newPhone, reason: 'Lost SIM, verified at the branch' },
+      body: { phone: newPhone, reason: 'Lost SIM, verified at the branch', code },
       jar: staff,
       params: { id: profile.id },
     });
@@ -602,9 +824,9 @@ describe('staff access', () => {
     expect(me.body.data.id).toBe(profile.id);
   });
 
-  it('deactivates with a reason, and lets a Branch Admin transfer to another branch', async () => {
+  it('deactivates with a reason, and lets a Super Admin transfer to another branch', async () => {
     const { profile } = await activeApplicant();
-    const staff = await signIn('staff.khi@jobbank.local');
+    const staff = await signInWith2fa('staff.khi@jobbank.local');
     const noReason = await call(staffStatus, `/api/v1/applicants/${profile.id}/status`, {
       method: 'PATCH',
       body: { status: 'INACTIVE' },
@@ -623,7 +845,9 @@ describe('staff access', () => {
       statusReason: 'Unreachable for 3 weeks',
     });
 
-    // Staff cannot transfer; the Branch Admin can.
+    // Staff cannot transfer; a Branch Admin cannot move an applicant to a
+    // branch outside their own branches (M13, staff.ts) — cross-city moves
+    // are a Super Admin's job.
     expect(
       (
         await call(transfer, `/api/v1/applicants/${profile.id}/transfer`, {
@@ -634,11 +858,19 @@ describe('staff access', () => {
         })
       ).status,
     ).toBe(403);
-    const admin = await signInAdmin('branchadmin.khi@jobbank.local');
+    const branchAdmin = await signInAdmin('branchadmin.khi@jobbank.local');
+    const crossCity = await call(transfer, `/api/v1/applicants/${profile.id}/transfer`, {
+      method: 'POST',
+      body: { branchId: lhr, expectedBranchId: khi, reason: 'Moved to Lahore' },
+      jar: branchAdmin,
+      params: { id: profile.id },
+    });
+    expect(crossCity.status, JSON.stringify(crossCity.body)).toBe(403);
+    const superAdmin = await signInAdmin('superadmin@jobbank.local');
     const moved = await call(transfer, `/api/v1/applicants/${profile.id}/transfer`, {
       method: 'POST',
-      body: { branchId: lhr, reason: 'Moved to Lahore' },
-      jar: admin,
+      body: { branchId: lhr, expectedBranchId: khi, reason: 'Moved to Lahore' },
+      jar: superAdmin,
       params: { id: profile.id },
     });
     expect(moved.status, JSON.stringify(moved.body)).toBe(200);
@@ -652,7 +884,7 @@ describe('staff access', () => {
         })
       ).status,
     ).toBe(403);
-    const lhrStaff = await signIn('staff.lhr@jobbank.local');
+    const lhrStaff = await signInWith2fa('staff.lhr@jobbank.local');
     expect(
       (
         await call(getApplicant, `/api/v1/applicants/${profile.id}`, {

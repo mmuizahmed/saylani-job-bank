@@ -34,9 +34,11 @@ export default async function SuperAdminCompaniesPage() {
 
   return (
     <div className="grid w-full gap-6">
-      <header>
-        <h1 className="text-fg text-2xl font-semibold">All companies</h1>
-        <p className="text-fg-muted mt-1 text-sm">{pagination.total} registered</p>
+      <header className="flex items-center justify-between">
+        <div>
+          <h1 className="text-fg text-2xl font-semibold">All companies</h1>
+          <p className="text-fg-muted mt-1 text-sm">{pagination.total} registered</p>
+        </div>
       </header>
 
       {items.length === 0 ? (
@@ -53,6 +55,7 @@ export default async function SuperAdminCompaniesPage() {
               <Link
                 key={c.id}
                 href={`/super-admin/companies/${c.id}`}
+                variant="unstyled"
                 className="border-border bg-surface hover:bg-surface-muted flex items-center justify-between rounded-xl border px-5 py-4 transition-colors"
               >
                 <div className="flex items-start gap-3">

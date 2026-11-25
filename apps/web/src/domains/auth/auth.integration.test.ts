@@ -1,6 +1,6 @@
-import { ROLE_PERMISSIONS, type Role } from '@jobbank/shared';
+import { ROLE_PERMISSIONS, TWO_FACTOR_REQUIRED_ROLES, type Role } from '@jobbank/shared';
 import { schema } from '@jobbank/db';
-import { DEV_PASSWORD, DEV_USERS } from '@jobbank/db/seed/dev-data';
+import { DEV_USERS, getSeedDevPassword } from '@jobbank/db/seed/dev-data';
 import { and, count, desc, eq } from 'drizzle-orm';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { POST as login } from '@/app/api/v1/auth/login/route';
@@ -12,19 +12,18 @@ import { PUT as scope } from '@/app/api/v1/auth/scope/route';
 import { GET as getBranchRoute } from '@/app/api/v1/branches/[id]/route';
 import { GET as listBranchesRoute } from '@/app/api/v1/branches/route';
 import { GET as listMasterDataRoute } from '@/app/api/v1/master-data/route';
-import { GET as radiusPoliciesRoute } from '@/app/api/v1/radius-policies/route';
 import { GET as listSettingsRoute } from '@/app/api/v1/settings/route';
 import { resetMemoryRateLimits } from '@/domains/shared/rate-limit';
 import { db } from '@/lib/db';
 import { devOutbox } from '@/lib/sms/sms';
 import { call, Jar, owner, signIn, signInAdmin } from '@/test/api-client';
 
-/** Admin roles must use two-factor; the helper enrols it on first sign-in in this file. */
+/** 2FA-required roles must enrol an authenticator; the helper enrols it on first sign-in in this file. */
 async function signInWithPassword(email: string) {
-  const admin = DEV_USERS.find((u) => u.email === email)?.roles.some(
-    (r) => r.role === 'SUPER_ADMIN' || r.role === 'BRANCH_ADMIN',
+  const needs2fa = DEV_USERS.find((u) => u.email === email)?.roles.some((r) =>
+    (TWO_FACTOR_REQUIRED_ROLES as readonly string[]).includes(r.role),
   );
-  return admin ? signInAdmin(email) : signIn(email);
+  return needs2fa ? signInAdmin(email) : signIn(email);
 }
 
 async function signInWithOtp(phone: string) {
@@ -90,9 +89,6 @@ describe('role × endpoint access matrix', () => {
       // M5: settings are for admins; reference lists are for every signed-in user.
       const canManageSettings = ROLE_PERMISSIONS[role as Role].includes('settings:manage');
       expect((await call(listSettingsRoute, '/api/v1/settings', { jar })).status).toBe(
-        canManageSettings ? 200 : 403,
-      );
-      expect((await call(radiusPoliciesRoute, '/api/v1/radius-policies', { jar })).status).toBe(
         canManageSettings ? 200 : 403,
       );
       expect(
@@ -220,7 +216,7 @@ describe('email + password sign-in', () => {
   it('only reveals a disabled account to someone who knows its password', async () => {
     const right = await call(login, '/api/v1/auth/login', {
       method: 'POST',
-      body: { email: 'disabled.staff@jobbank.local', password: DEV_PASSWORD },
+      body: { email: 'disabled.staff@jobbank.local', password: getSeedDevPassword() },
     });
     expect(right.status).toBe(403);
     expect(right.body.error.details).toEqual({ reason: 'ACCOUNT_DISABLED' });
@@ -247,7 +243,7 @@ describe('email + password sign-in', () => {
   it('refuses cross-site sign-in posts (CSRF)', async () => {
     const res = await call(login, '/api/v1/auth/login', {
       method: 'POST',
-      body: { email: 'employer@jobbank.local', password: DEV_PASSWORD },
+      body: { email: 'employer@jobbank.local', password: getSeedDevPassword() },
       headers: { origin: 'https://evil.example' },
     });
     expect(res.status).toBe(403);

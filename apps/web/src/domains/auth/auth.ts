@@ -3,13 +3,11 @@ import { schema } from '@jobbank/db';
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { APIError } from 'better-auth/api';
-import { emailOTP, phoneNumber, twoFactor } from 'better-auth/plugins';
+import { phoneNumber, twoFactor } from 'better-auth/plugins';
 import { eq, sql } from 'drizzle-orm';
 import { db } from '@/lib/db';
 import { env } from '@/lib/env';
 import { logger } from '@/lib/logger';
-import { sendMail } from '@/lib/mail/mailer';
-import { signInCodeEmail } from '@/lib/mail/templates';
 import { verifyOtpCode } from './otp';
 import { getAuthSecret } from './secret';
 
@@ -67,23 +65,19 @@ function createAuth() {
       maxPasswordLength: 128,
     },
     plugins: [
-      // Employers can sign in with a code emailed to them (existing accounts only).
-      emailOTP({
-        otpLength: 6,
-        expiresIn: 300,
-        allowedAttempts: 5,
-        storeOTP: 'hashed',
-        disableSignUp: true,
-        sendVerificationOTP: async ({ email, otp, type }) => {
-          if (type !== 'sign-in') return;
-          await sendMail({ to: email, ...signInCodeEmail({ code: otp, expiresMinutes: 5 }) });
-        },
-      }),
-      // Authenticator-app 2FA: required for Super Admin / Branch Admin, optional for others.
+      // Authenticator-app 2FA: required for Super Admin, Branch Admin, Staff
+      // and Employer, optional for Verifier / Interviewer-Scheduler.
+      // (Employer email-code sign-in was retired with mandatory employer 2FA
+      // 2026-11-15: a passwordless emailed code would bypass the authenticator,
+      // so the emailOTP plugin was removed rather than left as a back door.)
       twoFactor({
         issuer: 'Saylani Job Bank',
         backupCodeOptions: { amount: 10, length: 10 },
         twoFactorCookieMaxAge: 600,
+        // 30 days. The cookie is Secure whenever NEXT_PUBLIC_APP_URL is https
+        // (useSecureCookies above), which is how production is published
+        // through the Cloudflare tunnel. No extra proxy setting is required:
+        // the browser stores the cookie on the https page and sends it back.
         trustDeviceMaxAge: 30 * 24 * 60 * 60,
       }),
       phoneNumber({

@@ -1,13 +1,24 @@
 'use client';
 
-import { ArrowLeft, Briefcase, KeyRound, Lock, Mail, Shield, UserRound } from 'lucide-react';
+import {
+  ArrowLeft,
+  Briefcase,
+  Eye,
+  EyeOff,
+  KeyRound,
+  Lock,
+  Mail,
+  Shield,
+  UserRound,
+} from 'lucide-react';
 import NextLink from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Button, Checkbox, Input } from '@/components/atoms';
-import { FormField, OTPInput, PhoneInput, Tabs } from '@/components/molecules';
+import { ErrorBanner, FormField, OTPInput, PhoneInput } from '@/components/molecules';
 import { ApiClientError, apiFetch, safeNextPath } from '@/lib/api/client';
 import { formatPkMobileDisplay } from '@/lib/format/phone';
+import { TwoFactorSetup } from '@/app/(dashboard)/account/security/TwoFactorSetup';
 
 interface SignedIn {
   kind: 'signed_in';
@@ -16,6 +27,13 @@ interface SignedIn {
 interface TwoFactorRequired {
   kind: 'two_factor_required';
   methods: string[];
+  /** False only when the server could not resolve the account. */
+  trustDeviceAllowed: boolean;
+}
+interface TwoFactorSetupRequired {
+  kind: 'two_factor_setup_required';
+  setupToken: string;
+  expiresInSeconds: number;
 }
 
 function useCountdown() {
@@ -28,10 +46,8 @@ function useCountdown() {
   return [seconds, setSeconds] as const;
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof ApiClientError
-    ? error.message
-    : 'Something went wrong. Please try again.';
+function fieldError(error: unknown, path: string): string | undefined {
+  return error instanceof ApiClientError ? error.issueFor(path) : undefined;
 }
 
 function useFinishSignIn(next: string | null) {
@@ -42,13 +58,9 @@ function useFinishSignIn(next: string | null) {
   };
 }
 
-function Alert({ message }: { message: string | null }) {
-  if (!message) return null;
-  return (
-    <p role="alert" className="bg-danger-soft text-danger-soft-fg rounded-lg px-3 py-2 text-sm">
-      {message}
-    </p>
-  );
+function Alert({ error, operation = 'Sign in' }: { error: unknown; operation?: string }) {
+  if (error == null) return null;
+  return <ErrorBanner error={error} operation={operation} />;
 }
 
 function CodeStep({
@@ -66,7 +78,7 @@ function CodeStep({
   onBack: () => void;
   resendIn: number;
   pending: boolean;
-  error: string | null;
+  error: unknown;
 }) {
   const [code, setCode] = useState('');
   useEffect(() => {
@@ -92,7 +104,7 @@ function CodeStep({
         invalid={Boolean(error)}
         autoFocus
       />
-      <Alert message={error} />
+      <Alert error={error} />
       <Button type="submit" fullWidth disabled={code.length < 6} loading={pending}>
         Verify and continue
       </Button>
@@ -115,7 +127,7 @@ function PhoneSignIn({ next, onBack }: { next: string | null; onBack: () => void
   const [step, setStep] = useState<'phone' | 'code'>('phone');
   const [phone, setPhone] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [resendIn, setResendIn] = useCountdown();
 
   const sendCode = async () => {
@@ -130,7 +142,7 @@ function PhoneSignIn({ next, onBack }: { next: string | null; onBack: () => void
       setStep('code');
       setResendIn(data.resendAfterSeconds);
     } catch (err) {
-      setError(errorMessage(err));
+      setError(err);
     } finally {
       setPending(false);
     }
@@ -147,7 +159,7 @@ function PhoneSignIn({ next, onBack }: { next: string | null; onBack: () => void
       });
       finish(data);
     } catch (err) {
-      setError(errorMessage(err));
+      setError(err);
       setPending(false);
     }
   };
@@ -190,11 +202,12 @@ function PhoneSignIn({ next, onBack }: { next: string | null; onBack: () => void
         <FormField
           label="Mobile number"
           required
-          error={error ?? undefined}
+          error={fieldError(error, 'phone')}
           hint="New here? Your account is created when you verify."
         >
           <PhoneInput autoFocus onChange={(change) => setPhone(change.e164)} />
         </FormField>
+        <ErrorBanner error={error ?? undefined} operation="Send sign-in code" />
         <Button type="submit" fullWidth disabled={!phone} loading={pending}>
           Send code
         </Button>
@@ -208,31 +221,38 @@ function PhoneSignIn({ next, onBack }: { next: string | null; onBack: () => void
 function AuthenticatorStep({
   onDone,
   onBack,
+  trustDeviceAllowed,
 }: {
   onDone: (result: SignedIn) => void;
   onBack: () => void;
+  trustDeviceAllowed: boolean;
 }) {
   const [useBackup, setUseBackup] = useState(false);
   const [code, setCode] = useState('');
   const [backupCode, setBackupCode] = useState('');
   const [trustDevice, setTrustDevice] = useState(false);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  // The code field submits itself on the 6th digit. Keep the checkbox in a ref
+  // so that submit reads the box the user just ticked, not a stale render.
+  const trustRef = useRef(false);
+  trustRef.current = trustDeviceAllowed && trustDevice;
 
   const verify = async (value?: string) => {
     setPending(true);
     setError(null);
     try {
+      const trust = trustRef.current;
       const body = useBackup
-        ? { backupCode: backupCode.trim(), trustDevice }
-        : { code: value ?? code, trustDevice };
+        ? { backupCode: backupCode.trim(), trustDevice: trust }
+        : { code: value ?? code, trustDevice: trust };
       const { data } = await apiFetch<SignedIn>('/api/v1/auth/2fa/verify', {
         method: 'POST',
         body,
       });
       onDone(data);
     } catch (err) {
-      setError(errorMessage(err));
+      setError(err);
       setCode('');
       setPending(false);
     }
@@ -252,6 +272,16 @@ function AuthenticatorStep({
           ? 'Enter one of your saved backup codes.'
           : 'Open your authenticator app and enter the 6-digit code for Saylani Job Bank.'}
       </div>
+      <Checkbox
+        label="Trust this device for 30 days"
+        checked={trustDevice}
+        onCheckedChange={(v) => {
+          const next = v === true;
+          trustRef.current = trustDeviceAllowed && next;
+          setTrustDevice(next);
+        }}
+        disabled={!trustDeviceAllowed}
+      />
       {useBackup ? (
         <FormField label="Backup code" required>
           <Input
@@ -273,12 +303,7 @@ function AuthenticatorStep({
           label="Authenticator code"
         />
       )}
-      <Checkbox
-        label="Trust this device for 30 days"
-        checked={trustDevice}
-        onCheckedChange={(v) => setTrustDevice(v === true)}
-      />
-      <Alert message={error} />
+      <Alert error={error} />
       <Button
         type="submit"
         fullWidth
@@ -305,126 +330,74 @@ function AuthenticatorStep({
   );
 }
 
-function EmailCodeSignIn({ next, onBack }: { next: string | null; onBack: () => void }) {
-  const finish = useFinishSignIn(next);
-  const [email, setEmail] = useState('');
-  const [step, setStep] = useState<'email' | 'code'>('email');
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [resendIn, setResendIn] = useCountdown();
-
-  const send = async () => {
-    setPending(true);
-    setError(null);
-    try {
-      const { data } = await apiFetch<{ resendAfterSeconds: number }>(
-        '/api/v1/auth/email-otp/request',
-        { method: 'POST', body: { email } },
-      );
-      setStep('code');
-      setResendIn(data.resendAfterSeconds);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setPending(false);
-    }
-  };
-
-  const verify = async (code: string) => {
-    setPending(true);
-    setError(null);
-    try {
-      const { data } = await apiFetch<SignedIn>('/api/v1/auth/email-otp/verify', {
-        method: 'POST',
-        body: { email, code },
-      });
-      finish(data);
-    } catch (err) {
-      setError(errorMessage(err));
-      setPending(false);
-    }
-  };
-
-  if (step === 'code') {
-    return (
-      <CodeStep
-        destination={email}
-        onVerify={(code) => void verify(code)}
-        onResend={() => void send()}
-        onBack={() => setStep('email')}
-        resendIn={resendIn}
-        pending={pending}
-        error={error}
-      />
-    );
-  }
-  return (
-    <form
-      className="grid gap-4"
-      onSubmit={(event) => {
-        event.preventDefault();
-        void send();
-      }}
-    >
-      <p className="text-fg-muted text-sm">
-        Employers can sign in with a one-time code sent to their email.
-      </p>
-      <FormField label="Work email" required error={error ?? undefined}>
-        <Input
-          type="email"
-          autoComplete="username"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          startAdornment={<Mail aria-hidden="true" />}
-          autoFocus
-        />
-      </FormField>
-      <Button type="submit" fullWidth loading={pending} disabled={!email.includes('@')}>
-        Email me a code
-      </Button>
-      <Button
-        variant="link"
-        leftIcon={<ArrowLeft />}
-        onClick={onBack}
-        className="justify-self-start"
-      >
-        Use my password instead
-      </Button>
-    </form>
-  );
-}
-
 function StaffSignIn({ next, onBack }: { next: string | null; onBack: () => void }) {
   const finish = useFinishSignIn(next);
-  const [mode, setMode] = useState<'password' | 'two_factor' | 'email_code'>('password');
+  const [mode, setMode] = useState<'password' | 'two_factor' | 'two_factor_setup'>('password');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [showPw, setShowPw] = useState(false);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [trustDeviceAllowed, setTrustDeviceAllowed] = useState(true);
+  const [setupToken, setSetupToken] = useState<string | null>(null);
 
   if (mode === 'two_factor')
-    return <AuthenticatorStep onDone={finish} onBack={() => setMode('password')} />;
-  if (mode === 'email_code')
-    return <EmailCodeSignIn next={next} onBack={() => setMode('password')} />;
-
+    return (
+      <AuthenticatorStep
+        onDone={finish}
+        onBack={() => setMode('password')}
+        trustDeviceAllowed={trustDeviceAllowed}
+      />
+    );
+  if (mode === 'two_factor_setup' && setupToken)
+    return (
+      <div className="grid gap-4">
+        <p className="text-fg-muted text-sm">
+          Your role requires two-factor authentication. Set it up now to finish signing in — this
+          setup link expires in 15 minutes.
+        </p>
+        <TwoFactorSetup required setupToken={setupToken} />
+        <Button
+          variant="secondary"
+          leftIcon={<ArrowLeft />}
+          onClick={() => setMode('password')}
+          className="justify-self-start"
+        >
+          Back to sign-in
+        </Button>
+      </div>
+    );
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setPending(true);
     setError(null);
     try {
-      const { data } = await apiFetch<SignedIn | TwoFactorRequired>('/api/v1/auth/login', {
-        method: 'POST',
-        body: { email, password },
-      });
+      const { data } = await apiFetch<SignedIn | TwoFactorRequired | TwoFactorSetupRequired>(
+        '/api/v1/auth/login',
+        {
+          method: 'POST',
+          body: { email, password },
+        },
+      );
       if (data.kind === 'two_factor_required') {
         setPassword('');
         setPending(false);
+        setTrustDeviceAllowed(data.trustDeviceAllowed);
         setMode('two_factor');
+        return;
+      }
+      if (data.kind === 'two_factor_setup_required') {
+        // Audit H-02: no session was issued — the setup token is the only
+        // way forward, and it only starts enrolment.
+        setPassword('');
+        setPending(false);
+        setSetupToken(data.setupToken);
+        setMode('two_factor_setup');
         return;
       }
       finish(data);
     } catch (err) {
-      setError(errorMessage(err));
+      setError(err);
       setPending(false);
     }
   };
@@ -452,11 +425,21 @@ function StaffSignIn({ next, onBack }: { next: string | null; onBack: () => void
         </FormField>
         <FormField label="Password" required>
           <Input
-            type="password"
+            type={showPw ? 'text' : 'password'}
             autoComplete="current-password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             startAdornment={<Lock aria-hidden="true" />}
+            endAdornment={
+              <button
+                type="button"
+                aria-label={showPw ? 'Hide password' : 'Show password'}
+                onClick={() => setShowPw((v) => !v)}
+                className="text-fg-muted"
+              >
+                {showPw ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+              </button>
+            }
           />
         </FormField>
         <div className="-mt-2 text-end text-sm">
@@ -467,16 +450,9 @@ function StaffSignIn({ next, onBack }: { next: string | null; onBack: () => void
             Forgot password?
           </NextLink>
         </div>
-        <Alert message={error} />
+        <Alert error={error} />
         <Button type="submit" fullWidth loading={pending} disabled={!email || !password}>
           Sign in
-        </Button>
-        <Button
-          variant="link"
-          onClick={() => setMode('email_code')}
-          className="justify-self-center"
-        >
-          Employer? Email me a sign-in code instead
         </Button>
       </form>
     </div>

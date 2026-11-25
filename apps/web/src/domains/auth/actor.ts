@@ -1,10 +1,10 @@
 import 'server-only';
 import { permissionsFor, TWO_FACTOR_REQUIRED_ROLES, type Role } from '@jobbank/shared';
 import { schema } from '@jobbank/db';
-import { and, eq } from 'drizzle-orm';
+import { and, asc, eq } from 'drizzle-orm';
 import type { Actor } from '@/domains/shared/scope';
 import { db } from '@/lib/db';
-import { getAuth, isPlaceholderEmail } from './auth';
+import { getAuth, isPlaceholderEmail, SESSION_TTL_SECONDS } from './auth';
 
 export const ACTIVE_BRANCH_COOKIE = 'jb-active-branch';
 
@@ -53,7 +53,7 @@ export async function loadActor(userId: string, requestedActiveBranch?: string):
   ]);
 
   const roles = [...new Set(assignments.map((a) => a.role as Role))];
-  const [[applicant], [membership]] = await Promise.all([
+  const [[applicant], memberships] = await Promise.all([
     roles.includes('APPLICANT')
       ? db
           .select({ id: schema.applicants.id })
@@ -65,11 +65,16 @@ export async function loadActor(userId: string, requestedActiveBranch?: string):
           .select({ companyId: schema.companyMembers.companyId })
           .from(schema.companyMembers)
           .where(eq(schema.companyMembers.userId, userId))
+          .orderBy(asc(schema.companyMembers.createdAt))
       : [],
   ]);
   const branchIds = [
     ...new Set(assignments.map((a) => a.branchId).filter((id): id is string => id !== null)),
   ];
+
+  // One employer account holds one company: the first (only) membership is
+  // the active one.
+  const companyId = memberships[0]?.companyId ?? null;
 
   let activeBranchId: string | null = null;
   if (roles.includes('SUPER_ADMIN') && requestedActiveBranch && UUID.test(requestedActiveBranch)) {
@@ -88,7 +93,7 @@ export async function loadActor(userId: string, requestedActiveBranch?: string):
     permissions: permissionsFor(roles),
     branchIds,
     activeBranchId,
-    companyId: membership?.companyId ?? null,
+    companyId,
     applicantId: applicant?.id ?? null,
     twoFactorPending: requiresTwoFactor(roles) && !user?.twoFactorEnabled,
   };
@@ -98,6 +103,15 @@ export async function loadActor(userId: string, requestedActiveBranch?: string):
 export async function getAuthState(headers: Headers): Promise<AuthState> {
   const session = await getAuth().api.getSession({ headers });
   if (!session) return { status: 'anonymous' };
+
+  // Audit 2026-11-11 (M-19): absolute session lifetime — Better Auth only
+  // slides expiry (updateAge 24h), so a daily-active session never expired.
+  // A session older than SESSION_TTL_SECONDS (7 days) from creation is
+  // rejected outright, however recently it was used. The caller just signs
+  // in again; nothing else changes (the sliding window still applies
+  // inside the 7 days).
+  const createdAt = new Date(session.session.createdAt).getTime();
+  if (Date.now() - createdAt > SESSION_TTL_SECONDS * 1000) return { status: 'anonymous' };
 
   const [row] = await db
     .select({

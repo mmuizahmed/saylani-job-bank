@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { Input } from '@/components/atoms/Input';
 import {
   formatPkMobileNational,
+  isSupportedPkMobile,
   normalizePkMobile,
   toNationalMobileDigits,
 } from '@/lib/format/phone';
@@ -30,7 +31,10 @@ export function PhoneInput({
         const next = toNationalMobileDigits(event.target.value);
         setInternal(next);
         const e164 = normalizePkMobile(next);
-        onChange?.({ e164, national: next, valid: e164 !== null });
+        // Audit 2026-11-11 (L-03): only emit E.164 for allowlisted
+        // prefixes — any other 3xx shape is rejected by the server.
+        const supported = e164 !== null && isSupportedPkMobile(e164);
+        onChange?.({ e164: supported ? e164 : null, national: next, valid: supported });
       }}
       startAdornment={
         <span className="border-border text-fg-muted numeric border-e pe-2 text-sm font-medium">

@@ -277,7 +277,23 @@ const doc = (
   mimeTypes = IMAGES_PDF,
   maxSizeMb = 5,
   multiple = false,
-): SeedItem => ({ code, label, meta: { appliesTo, required, mimeTypes, maxSizeMb, multiple } });
+  requirements: {
+    requiredForCategories?: string[];
+    requiredAlternativeForCategories?: string[];
+  } = {},
+): SeedItem => ({
+  code,
+  label,
+  meta: {
+    appliesTo,
+    required,
+    requiredForCategories: requirements.requiredForCategories ?? [],
+    requiredAlternativeForCategories: requirements.requiredAlternativeForCategories ?? [],
+    mimeTypes,
+    maxSizeMb,
+    multiple,
+  },
+});
 
 export const MASTER_DATA_SEED: Record<MasterDataType, SeedItem[]> = {
   JOB_CATEGORY: Object.entries(CATEGORY_SKILLS).map(([code, { label }]) => ({ code, label })),
@@ -297,6 +313,7 @@ export const MASTER_DATA_SEED: Record<MasterDataType, SeedItem[]> = {
     { code: 'PHD', label: 'PhD', meta: { rank: 8 } },
   ],
   LANGUAGE: [
+    // Pakistan languages (shown first)
     { code: 'URDU', label: 'Urdu' },
     { code: 'ENGLISH', label: 'English' },
     { code: 'SINDHI', label: 'Sindhi' },
@@ -304,7 +321,52 @@ export const MASTER_DATA_SEED: Record<MasterDataType, SeedItem[]> = {
     { code: 'PASHTO', label: 'Pashto' },
     { code: 'BALOCHI', label: 'Balochi' },
     { code: 'SARAIKI', label: 'Saraiki' },
+    { code: 'HINDKO', label: 'Hindko' },
+    { code: 'BRAHUI', label: 'Brahui' },
+    // Major world languages
     { code: 'ARABIC', label: 'Arabic' },
+    { code: 'MANDARIN', label: 'Mandarin Chinese' },
+    { code: 'SPANISH', label: 'Spanish' },
+    { code: 'FRENCH', label: 'French' },
+    { code: 'GERMAN', label: 'German' },
+    { code: 'HINDI', label: 'Hindi' },
+    { code: 'BENGALI', label: 'Bengali' },
+    { code: 'PORTUGUESE', label: 'Portuguese' },
+    { code: 'RUSSIAN', label: 'Russian' },
+    { code: 'JAPANESE', label: 'Japanese' },
+    { code: 'KOREAN', label: 'Korean' },
+    { code: 'TURKISH', label: 'Turkish' },
+    { code: 'ITALIAN', label: 'Italian' },
+    { code: 'DUTCH', label: 'Dutch' },
+    { code: 'PERSIAN', label: 'Persian (Farsi)' },
+    { code: 'SWAHILI', label: 'Swahili' },
+    { code: 'MALAY', label: 'Malay / Indonesian' },
+    { code: 'THAI', label: 'Thai' },
+    { code: 'VIETNAMESE', label: 'Vietnamese' },
+    { code: 'POLISH', label: 'Polish' },
+    { code: 'UKRAINIAN', label: 'Ukrainian' },
+    { code: 'ROMANIAN', label: 'Romanian' },
+    { code: 'GREEK', label: 'Greek' },
+    { code: 'CZECH', label: 'Czech' },
+    { code: 'HUNGARIAN', label: 'Hungarian' },
+    { code: 'SWEDISH', label: 'Swedish' },
+    { code: 'NORWEGIAN', label: 'Norwegian' },
+    { code: 'DANISH', label: 'Danish' },
+    { code: 'FINNISH', label: 'Finnish' },
+    { code: 'HEBREW', label: 'Hebrew' },
+    { code: 'AMHARIC', label: 'Amharic' },
+    { code: 'HAUSA', label: 'Hausa' },
+    { code: 'YORUBA', label: 'Yoruba' },
+    { code: 'IGBO', label: 'Igbo' },
+    { code: 'TAGALOG', label: 'Tagalog / Filipino' },
+    { code: 'GUJARATI', label: 'Gujarati' },
+    { code: 'MARATHI', label: 'Marathi' },
+    { code: 'TAMIL', label: 'Tamil' },
+    { code: 'TELUGU', label: 'Telugu' },
+    { code: 'KANNADA', label: 'Kannada' },
+    { code: 'MALAYALAM', label: 'Malayalam' },
+    { code: 'NEPALI', label: 'Nepali' },
+    { code: 'SINHALA', label: 'Sinhala' },
   ],
   CITY: CITIES.map(([code, label, province]) => ({ code, label, meta: { province } })),
   AREA: Object.entries(AREAS).flatMap(([city, areas]) =>
@@ -315,11 +377,39 @@ export const MASTER_DATA_SEED: Record<MasterDataType, SeedItem[]> = {
     doc('CNIC_BACK', 'CNIC (back)', 'APPLICANT', true, ['image/jpeg', 'image/png']),
     doc('CV', 'CV / résumé', 'APPLICANT', false, ['application/pdf']),
     doc('PHOTO', 'Passport-size photo', 'APPLICANT', false, ['image/jpeg', 'image/png'], 2),
-    doc('EDUCATION_CERTIFICATE', 'Education certificate', 'APPLICANT', false, IMAGES_PDF, 5, true),
+    doc(
+      'EDUCATION_CERTIFICATE',
+      'Education certificate / degree',
+      'APPLICANT',
+      false,
+      IMAGES_PDF,
+      5,
+      true,
+      { requiredAlternativeForCategories: ['HEALTHCARE'] },
+    ),
     doc('EXPERIENCE_LETTER', 'Experience letter', 'APPLICANT', false, IMAGES_PDF, 5, true),
-    doc('DRIVING_LICENSE', 'Driving licence', 'APPLICANT', false),
+    doc('DRIVING_LICENSE', 'Driving licence', 'APPLICANT', false, IMAGES_PDF, 5, false, {
+      requiredForCategories: ['DRIVING_DELIVERY'],
+    }),
+    doc(
+      'HEALTHCARE_LICENSE',
+      'Professional licence / registration',
+      'APPLICANT',
+      false,
+      IMAGES_PDF,
+      5,
+      true,
+      { requiredAlternativeForCategories: ['HEALTHCARE'] },
+    ),
     doc('CHARACTER_CERTIFICATE', 'Police character certificate', 'APPLICANT', false),
-    doc('AUTHORISED_PERSON_CNIC', 'CNIC of authorised person', 'COMPANY', true),
+    doc('AUTHORISED_PERSON_CNIC_FRONT', 'CNIC of authorised person — front', 'COMPANY', true, [
+      'image/jpeg',
+      'image/png',
+    ]),
+    doc('AUTHORISED_PERSON_CNIC_BACK', 'CNIC of authorised person — back', 'COMPANY', true, [
+      'image/jpeg',
+      'image/png',
+    ]),
     doc('NTN_CERTIFICATE', 'NTN certificate', 'COMPANY', false),
     doc('SECP_REGISTRATION', 'SECP incorporation certificate', 'COMPANY', false),
     doc('BUSINESS_REGISTRATION', 'Business registration / chamber certificate', 'COMPANY', false),
@@ -421,6 +511,11 @@ export const MASTER_DATA_SEED: Record<MasterDataType, SeedItem[]> = {
     ['GOVERNMENT', 'Government & public sector'],
     ['OTHER', 'Other'],
   ].map(([code, label]) => ({ code: code!, label: label! })),
+  // DESIGNATION (job posting form, 2026-11-10): intentionally empty — the
+  // user supplies the designation list with its salary ranges, and Super
+  // Admin adds them in Master data. Until then a job's designation is
+  // free text and no salary-range check can run.
+  DESIGNATION: [],
 };
 
 /** Required company documents per legal structure (M7); insert-only like the lists above. */

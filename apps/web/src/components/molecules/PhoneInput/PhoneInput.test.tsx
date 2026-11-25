@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { CNICInput } from '../CNICInput';
@@ -25,6 +25,40 @@ describe('PhoneInput', () => {
     expect(onChange).toHaveBeenLastCalledWith(
       expect.objectContaining({ e164: null, valid: false }),
     );
+  });
+
+  it('has no prefix dropdown — the full number is typed in one field', async () => {
+    const onChange = vi.fn();
+    render(<PhoneInput aria-label="Mobile" onChange={onChange} />);
+    expect(screen.queryByLabelText('Original network allocation')).not.toBeInTheDocument();
+    const input = screen.getByLabelText('Mobile');
+    await userEvent.type(input, '03441234567');
+    expect(input).toHaveValue('344 1234567');
+    expect(onChange).toHaveBeenLastCalledWith({
+      e164: '+923441234567',
+      national: '3441234567',
+      valid: true,
+    });
+  });
+
+  it('keeps the +92 prefix locked and normalizes a pasted international number', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<PhoneInput aria-label="Company mobile" onChange={onChange} />);
+
+    const input = screen.getByLabelText('Company mobile');
+    expect(screen.getByText('+92')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Original network allocation')).not.toBeInTheDocument();
+
+    await user.click(input);
+    fireEvent.change(input, { target: { value: '+923001234567' } });
+
+    expect(input).toHaveValue('300 1234567');
+    expect(onChange).toHaveBeenLastCalledWith({
+      e164: '+923001234567',
+      national: '3001234567',
+      valid: true,
+    });
   });
 });
 

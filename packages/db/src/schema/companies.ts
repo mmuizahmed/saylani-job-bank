@@ -39,10 +39,10 @@ const timestamps = {
 const list = (values: readonly string[]) => sql.raw(values.map((v) => `'${v}'`).join(', '));
 
 /**
- * M7: an employer's company. Created as a DRAFT by the employer's registration wizard; the
- * branch is chosen at the head-office step. While a verification round is open, `status`
- * mirrors the round's state. Only VERIFIED companies are visible to Branch Admin and may
- * post jobs (PRD rule 2) — see `company_is_verified()` for the M8 database check.
+ * M7: an employer's company. Employer wizard registrations start as DRAFT; staff-assisted
+ * registrations may provision a company as VERIFIED after reviewing the supplied details.
+ * While a verification round is open, `status` mirrors the round's state. Only VERIFIED
+ * companies are visible to Branch Admin and may post jobs (PRD rule 2).
  */
 export const companies = pgTable(
   'companies',
@@ -52,8 +52,8 @@ export const companies = pgTable(
     legalName: text().notNull(),
     tradeName: text(),
     legalStructure: text({ enum: LEGAL_STRUCTURES }).notNull(),
-    /** "1234567-8", a 7-digit NTN, or a 13-digit CNIC-based NTN. */
-    ntn: text().notNull(),
+    /** "1234567-8", a 7-digit NTN, or a 13-digit CNIC-based NTN. Nullable from migration 0047: staff field-visit onboarding does not require an NTN (2026-11-13). */
+    ntn: text(),
     registrationNo: text(),
     industryCode: text().notNull(),
     sizeBand: text({ enum: COMPANY_SIZE_BANDS }).notNull(),
@@ -62,6 +62,10 @@ export const companies = pgTable(
     status: text({ enum: COMPANY_STATUSES }).notNull().default('DRAFT'),
     /** Why the company was suspended (shown to Job Bank staff). */
     statusReason: text(),
+    /** When the first-counter paper form was verified and signed (null until then). */
+    registrationVerifiedSignedAt: timestamp({ withTimezone: true }),
+    /** Who recorded the verified & signed mark. */
+    registrationVerifiedSignedBy: uuid().references(() => users.id, { onDelete: 'set null' }),
     verifiedAt: timestamp({ withTimezone: true }),
     createdBy: uuid()
       .notNull()
@@ -70,6 +74,11 @@ export const companies = pgTable(
   },
   (t) => [
     index('companies_branch_status_idx').on(t.branchId, t.status),
+    // Trigram indexes for the staff `ILIKE '%q%'` name search (company/staff.ts).
+    // GIN has no default opclass for text — `gin_trgm_ops` must be named
+    // explicitly or CREATE INDEX fails with 42704 (migration 0027).
+    index('companies_legal_name_trgm_idx').using('gin', sql`${t.legalName} gin_trgm_ops`),
+    index('companies_trade_name_trgm_idx').using('gin', sql`${t.tradeName} gin_trgm_ops`),
     // Owner decision 4: one live company per NTN. Drafts don't count (no squatting), and a
     // rejected company may be re-registered properly by its real owner.
     uniqueIndex('companies_ntn_active_uq')
@@ -81,7 +90,13 @@ export const companies = pgTable(
       sql`${t.legalStructure} in (${list(LEGAL_STRUCTURES)})`,
     ),
     check('companies_size_band_valid', sql`${t.sizeBand} in (${list(COMPANY_SIZE_BANDS)})`),
-    check('companies_ntn_format', sql`${t.ntn} ~ '^([0-9]{7}(-[0-9])?|[1-9][0-9]{12})$'`),
+    // A null NTN passes: staff onboarding leaves it blank (migration 0047).
+    // The partial unique index below still stops two live companies sharing
+    // one non-null NTN; Postgres treats NULLs as distinct there.
+    check(
+      'companies_ntn_format',
+      sql`${t.ntn} is null or ${t.ntn} ~ '^([0-9]{7}(-[0-9])?|[1-9][0-9]{12})$'`,
+    ),
     check(
       'companies_submitted_needs_branch',
       sql`${t.status} = 'DRAFT' or ${t.branchId} is not null`,
@@ -89,7 +104,47 @@ export const companies = pgTable(
   ],
 );
 
-/** Employer accounts acting for a company. v1: one company per account (owner decision 2). */
+/**
+ * The field-visit outreach record for a company registered by staff (one row per
+ * company, only when staff onboarded it after a visit). Previously this lived only
+ * on the `company.register` audit entry, which meant any audit retention/purge —
+ * or the PII redaction the audit trail needs — silently destroyed the record and
+ * broke re-print. The audit row remains as evidence; this table is the record.
+ * `agreed` is a legacy column, always true: the agreement checkbox was removed
+ * 2026-11-14, the column is kept (no migration) so existing rows stay valid,
+ * and new rows take the default. Nothing reads it except the verify paper-form
+ * gate in domains/company/verifier.ts.
+ */
+export const companyOnboarding = pgTable(
+  'company_onboarding',
+  {
+    companyId: uuid()
+      .primaryKey()
+      .references(() => companies.id, { onDelete: 'cascade' }),
+    /** The staff member who visited and onboarded the company. */
+    onboardedBy: uuid().references(() => users.id, { onDelete: 'set null' }),
+    /** Pakistan calendar date of the field visit (yyyy-mm-dd). */
+    visitDate: date({ mode: 'string' }),
+    agreed: boolean().notNull().default(true),
+    headOfficeAddress: text(),
+    otherSites: text(),
+    workforceRoles: text(),
+    workforceType: text(),
+    workforceShifts: text(),
+    workforceOpenings: text(),
+    yearsInBusiness: text(),
+    previousHiring: text(),
+    certifications: text(),
+    additionalNotes: text(),
+    ...timestamps,
+  },
+  (t) => [index('company_onboarding_onboarded_by_idx').on(t.onboardedBy)],
+);
+
+/** Employer accounts acting for a company. One company per account
+ * (2026-11-17: an employer creates and runs one company at a time); the
+ * (companyId, userId) primary key still stops the same account joining the
+ * same company twice. */
 export const companyMembers = pgTable(
   'company_members',
   {
@@ -98,7 +153,6 @@ export const companyMembers = pgTable(
       .references(() => companies.id, { onDelete: 'cascade' }),
     userId: uuid()
       .notNull()
-      .unique()
       .references(() => users.id, { onDelete: 'restrict' }),
     role: text({ enum: COMPANY_MEMBER_ROLES }).notNull().default('OWNER'),
     createdAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
@@ -249,6 +303,13 @@ export const companyVerifications = pgTable(
     /** Last (re)submission: the SLA counts from here. */
     clockStartedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
     slaDueOn: date({ mode: 'string' }).notNull(),
+    /**
+     * Working days left on the SLA when info was requested (M23): the clock
+     * pauses while the employer replies, and resubmit resumes from here
+     * instead of granting a full fresh SLA. Null until the first info
+     * request; written by requestInfo in verifier.ts.
+     */
+    slaRemainingDays: integer(),
     /** The employer's latest message when resubmitting. */
     employerNote: text(),
     /** The verifier's latest request for information, and when it was sent (SLA paused). */

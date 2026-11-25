@@ -2,6 +2,7 @@ import 'server-only';
 import type { GeoPoint } from '@jobbank/db';
 import {
   COMPANY_LEGAL_FIELDS,
+  isResubmitNoteSufficient,
   type CompanyContactsInput,
   type CompanyHeadOfficeInput,
   type CompanySiteInput,
@@ -10,7 +11,7 @@ import {
 } from '@jobbank/shared';
 import { and, eq, inArray, max, ne, notInArray } from 'drizzle-orm';
 import { getBranchContact, listBranchOptions, type BranchOption } from '@/domains/branch';
-import { assertActiveMasterData } from '@/domains/settings';
+import { assertActiveMasterData, getWorkingCalendar, slaDueDate } from '@/domains/settings';
 import { runCommand } from '@/domains/shared/audit';
 import {
   ConflictError,
@@ -29,8 +30,10 @@ import {
   assertCityArea,
   buildCompanyView,
   c,
+  changedSinceInfoRequest,
   contacts,
   findCompanyForUser,
+  loadCompany,
   locs,
   members,
   openVerification,
@@ -98,12 +101,17 @@ export async function registerCompany(
   input: RegisterCompanyInput,
 ): Promise<CompanyView> {
   assertPermission(ctx.actor, 'company:register');
+  let createdId = '';
   try {
-    await runCommand(ctx, async ({ tx, audit }) => {
-      if (await findCompanyForUser(tx, ctx.actor.userId)) {
-        throw new ConflictError('You have already registered a company', {
-          reason: 'ALREADY_REGISTERED',
-        });
+    createdId = await runCommand(ctx, async ({ tx, audit }) => {
+      // One employer account holds one company; a second registration is
+      // refused with the same ALREADY_REGISTERED conflict as before.
+      const existing = await findCompanyForUser(tx, ctx.actor.userId);
+      if (existing) {
+        throw new ConflictError(
+          'You already have a registered company. To register another company, use a different email address.',
+          { reason: 'ALREADY_REGISTERED' },
+        );
       }
       await assertActiveMasterData(tx, 'INDUSTRY', [input.industryCode], () => 'industryCode');
       await assertNtnFree(tx, input.ntn);
@@ -118,16 +126,16 @@ export async function registerCompany(
         entityId: row!.id,
         after: input,
       });
+      return row!.id;
     });
   } catch (error) {
-    if (isUniqueViolation(error, 'company_members_user_id_unique')) {
-      throw new ConflictError('You have already registered a company', {
-        reason: 'ALREADY_REGISTERED',
-      });
-    }
+    // A concurrent duplicate NTN hits the active-NTN unique index (L12): report
+    // it as NTN_TAKEN, not a generic 409.
+    if (isUniqueViolation(error, ACTIVE_NTN_CONSTRAINT)) throw ntnTaken();
     throw error;
   }
-  return myCompany(ctx.actor);
+  // Return the company just created.
+  return buildCompanyView(db, await loadCompany(db, createdId));
 }
 
 const LEGAL = new Set<string>(COMPANY_LEGAL_FIELDS);
@@ -152,34 +160,43 @@ export async function updateMyCompany(
 ): Promise<CompanyView> {
   assertPermission(ctx.actor, 'company:register');
   try {
-    await runCommand(ctx, async ({ tx, audit }) => {
-      const row = await requireOwnCompany(tx, ctx.actor, { forUpdate: true });
-      const changes = Object.fromEntries(
-        Object.entries(input).filter(
-          ([key, value]) => value !== undefined && value !== row[key as keyof CompanyRow],
-        ),
-      ) as UpdateCompanyInput;
-      if (Object.keys(changes).length === 0) return;
-      const editable = companyEditability(row.status);
-      const touchesLegal = Object.keys(changes).some((key) => LEGAL.has(key));
-      if (touchesLegal && !editable.legal) throw readOnlyError(row, 'its legal details');
-      if (!editable.details) throw readOnlyError(row, 'its details');
-      if (changes.industryCode) {
-        await assertActiveMasterData(tx, 'INDUSTRY', [changes.industryCode], () => 'industryCode');
-      }
-      if (changes.ntn) await assertNtnFree(tx, changes.ntn, row.id);
-      await tx.update(c).set(changes).where(eq(c.id, row.id));
-      audit({
-        action: 'company.update',
-        entityType: 'company',
-        entityId: row.id,
-        branchId: row.branchId,
-        before: Object.fromEntries(
-          Object.keys(changes).map((k) => [k, row[k as keyof CompanyRow]]),
-        ),
-        after: changes,
-      });
-    });
+    await runCommand(
+      ctx,
+      async ({ tx, audit }) => {
+        const row = await requireOwnCompany(tx, ctx.actor, { forUpdate: true });
+        const changes = Object.fromEntries(
+          Object.entries(input).filter(
+            ([key, value]) => value !== undefined && value !== row[key as keyof CompanyRow],
+          ),
+        ) as UpdateCompanyInput;
+        if (Object.keys(changes).length === 0) return; // valid no-op; audited:false below
+        const editable = companyEditability(row.status);
+        const touchesLegal = Object.keys(changes).some((key) => LEGAL.has(key));
+        if (touchesLegal && !editable.legal) throw readOnlyError(row, 'its legal details');
+        if (!editable.details) throw readOnlyError(row, 'its details');
+        if (changes.industryCode) {
+          await assertActiveMasterData(
+            tx,
+            'INDUSTRY',
+            [changes.industryCode],
+            () => 'industryCode',
+          );
+        }
+        if (changes.ntn) await assertNtnFree(tx, changes.ntn, row.id);
+        await tx.update(c).set(changes).where(eq(c.id, row.id));
+        audit({
+          action: 'company.update',
+          entityType: 'company',
+          entityId: row.id,
+          branchId: row.branchId,
+          before: Object.fromEntries(
+            Object.keys(changes).map((k) => [k, row[k as keyof CompanyRow]]),
+          ),
+          after: changes,
+        });
+      },
+      { audited: false },
+    );
   } catch (error) {
     if (isUniqueViolation(error, ACTIVE_NTN_CONSTRAINT)) throw ntnTaken();
     throw error;
@@ -230,11 +247,13 @@ export async function setMyHeadOffice(
         'Your company has been submitted, so only Job Bank can move it to another branch. Please contact your branch.',
       );
     }
-    await assertCityArea(tx, input);
     const branch = await getBranchContact(input.branchId, tx);
     if (!branch?.isActive) {
       throw new ValidationError([{ path: 'branchId', message: 'Choose an active branch' }]);
     }
+    // H12: the city must be an active CITY and the area (if given) must belong to it,
+    // mirroring setMyLocation on the applicant side.
+    await assertCityArea(tx, input);
     const values = {
       label: 'Head office',
       addressLine: input.addressLine,
@@ -277,6 +296,7 @@ export async function addMySite(ctx: SignedIn, input: CompanySiteInput): Promise
   await runCommand(ctx, async ({ tx, audit }) => {
     const row = await requireOwnCompany(tx, ctx.actor, { forUpdate: true });
     if (!companyEditability(row.status).locations) throw readOnlyError(row, 'its locations');
+    // H12: see setMyHeadOffice.
     await assertCityArea(tx, input);
     const existing = await tx
       .select({ id: locs.id, archivedAt: locs.archivedAt })
@@ -311,6 +331,7 @@ export async function updateMySite(
     const row = await requireOwnCompany(tx, ctx.actor, { forUpdate: true });
     if (!companyEditability(row.status).locations) throw readOnlyError(row, 'its locations');
     const site = await ownSite(tx, row, siteId);
+    // H12: see setMyHeadOffice.
     await assertCityArea(tx, input);
     await tx.update(locs).set(input).where(eq(locs.id, site.id));
     audit({
@@ -346,7 +367,7 @@ export async function removeMySite(ctx: SignedIn, siteId: string): Promise<Compa
 
 // ─── Submission ────────────────────────────────────────────────────────
 
-/** Sends a DRAFT (or a corrected REJECTED) company to the verifier queue: a new round. */
+/** Sends a DRAFT (or a corrected REJECTED) company to Branch Admin review: a new round. */
 export async function submitMyCompany(ctx: SignedIn): Promise<CompanyView> {
   assertPermission(ctx.actor, 'company:register');
   const now = new Date();
@@ -364,7 +385,9 @@ export async function submitMyCompany(ctx: SignedIn): Promise<CompanyView> {
       if (await openVerification(tx, row.id)) {
         throw new ConflictError('This company is already waiting for verification');
       }
-      await assertNtnFree(tx, row.ntn, row.id);
+      // Employer companies always carry an NTN (registerCompanySchema still
+      // requires it); the guard is for the now-nullable column type only.
+      if (row.ntn) await assertNtnFree(tx, row.ntn, row.id);
       const [{ last } = { last: 0 }] = await tx
         .select({ last: max(ver.round) })
         .from(ver)
@@ -420,6 +443,19 @@ export async function submitMyCompany(ctx: SignedIn): Promise<CompanyView> {
   return view;
 }
 
+/**
+ * M23: the due date for a resubmitted round. When the verifier's info request
+ * recorded the working days left (`slaRemainingDays`, migration 0032), the
+ * clock resumes from the resubmit date with exactly those days — the same
+ * working-days helper `verificationDueOn` uses. Null (a round paused before
+ * migration 0032, or one that never paused) keeps the previous behaviour: a
+ * full fresh SLA from the resubmit date.
+ */
+async function resubmitDueOn(now: Date, slaRemainingDays: number | null): Promise<string> {
+  if (slaRemainingDays == null) return verificationDueOn(now);
+  return slaDueDate(now, slaRemainingDays, await getWorkingCalendar());
+}
+
 /** After "more information needed": the employer made the changes and sends it back. */
 export async function resubmitMyCompany(
   ctx: SignedIn,
@@ -427,7 +463,6 @@ export async function resubmitMyCompany(
 ): Promise<CompanyView> {
   assertPermission(ctx.actor, 'company:register');
   const now = new Date();
-  const dueOn = await verificationDueOn(now);
   await runCommand(ctx, async ({ tx, audit }) => {
     const row = await requireOwnCompany(tx, ctx.actor, { forUpdate: true });
     const to = companyMachine.transition(
@@ -438,6 +473,24 @@ export async function resubmitMyCompany(
     );
     const round = await openVerification(tx, row.id, { forUpdate: true });
     if (!round) throw new ConflictError('There is no open verification to send back');
+    // M18: an unchanged company cannot be bounced back and burn a fresh SLA — a
+    // real note, or proof something changed since the verifier asked for more.
+    if (
+      !isResubmitNoteSufficient(input.note) &&
+      !(await changedSinceInfoRequest(tx, row.id, round.infoRequestedAt))
+    ) {
+      throw new ValidationError([
+        {
+          path: 'note',
+          message:
+            'Tell the verifier what you changed or sent (at least 10 characters), or upload the document they asked for first.',
+        },
+      ]);
+    }
+    // M23: resubmitting resumes the paused SLA instead of granting a full fresh
+    // one — the due date is the resubmit date + the working days that were left
+    // when the verifier asked for more information (recorded by requestInfo).
+    const dueOn = await resubmitDueOn(now, round.slaRemainingDays);
     await tx
       .update(ver)
       .set({ state: 'RESUBMITTED', employerNote: input.note, clockStartedAt: now, slaDueOn: dueOn })

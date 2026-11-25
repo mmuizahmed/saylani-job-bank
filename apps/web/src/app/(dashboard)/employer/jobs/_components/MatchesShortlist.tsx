@@ -4,10 +4,10 @@ import { useState, useTransition, type ReactNode } from 'react';
 import { useRouter, useSearchParams, usePathname } from 'next/navigation';
 import { BarChart3, Check, Eye, RefreshCw, UserPlus, Users, X } from 'lucide-react';
 import type { JobMatchView, MatchesPage, MatchReviewStatus } from '@/domains/matching';
-import { apiFetch } from '@/lib/api/client';
+import { apiFetch, friendlyApiError } from '@/lib/api/client';
 import { formatDate } from '@/lib/format/date';
 import { Badge, Button, Label, Select, StatusPill, Textarea } from '@/components/atoms';
-import { DistanceBadge, EmptyState, Modal, toast } from '@/components/molecules';
+import { EmptyState, Modal, toast } from '@/components/molecules';
 import { DataTable } from '@/components/organisms';
 
 export interface ReasonOption {
@@ -41,7 +41,6 @@ const FACTOR_LABELS: Record<string, string> = {
   experience: 'Experience',
   education: 'Education',
   languages: 'Languages',
-  distance: 'Distance',
   salary: 'Salary',
   preferences: 'Job preferences',
   text_fit: 'Profile fit (AI)',
@@ -94,7 +93,7 @@ export function MatchesShortlist({ jobId, matches, page, pageSize, reasons }: Pr
         // The Python worker usually finishes in well under a second (LISTEN wakeup).
         setTimeout(() => router.refresh(), 2_500);
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : 'Could not queue recalculation.');
+        toast.error(friendlyApiError(e));
       }
     });
   }
@@ -118,7 +117,7 @@ export function MatchesShortlist({ jobId, matches, page, pageSize, reasons }: Pr
       setModalError(null);
       router.refresh();
     } catch (e) {
-      const message = e instanceof Error ? e.message : 'Could not update the decision.';
+      const message = friendlyApiError(e);
       setModalError(message);
       toast.error(message);
     } finally {
@@ -182,7 +181,7 @@ export function MatchesShortlist({ jobId, matches, page, pageSize, reasons }: Pr
         <StatusPill {...runPill} />
         <span className="text-fg-muted">
           <span className="numeric text-fg font-medium">{matches.total}</span> eligible of{' '}
-          <span className="numeric">{run.candidateCount ?? '—'}</span> nearby candidates
+          <span className="numeric">{run.candidateCount ?? '—'}</span> candidates
         </span>
         {run.completedAt && (
           <span className="text-fg-subtle">Calculated {formatDate(run.completedAt)}</span>
@@ -200,7 +199,7 @@ export function MatchesShortlist({ jobId, matches, page, pageSize, reasons }: Pr
           <EmptyState
             icon={Users}
             title="No eligible applicants yet"
-            description="Nobody nearby matched the required skills and filters. Try widening the requirements or wait for new applicants."
+            description="Nobody matched the required skills and filters. Try widening the requirements or wait for new applicants."
             compact
           />
         }
@@ -241,19 +240,17 @@ export function MatchesShortlist({ jobId, matches, page, pageSize, reasons }: Pr
                     style={{ width: `${Math.min(100, r.score ?? 0)}%` }}
                   />
                 </div>
+                {r.thinProfile && (
+                  <Badge
+                    tone="warning"
+                    size="sm"
+                    title="Thin profile: fewer than half the scored factors had real data behind them, so this score is weakly evidenced. Ask the applicant to complete their profile before shortlisting."
+                  >
+                    Thin profile
+                  </Badge>
+                )}
               </div>
             ),
-          },
-          {
-            id: 'distance',
-            header: 'Distance',
-            hideBelow: 'md',
-            cell: (r) =>
-              r.distanceM != null ? (
-                <DistanceBadge meters={r.distanceM} masked />
-              ) : (
-                <span className="text-fg-subtle">—</span>
-              ),
           },
           {
             id: 'status',
@@ -382,6 +379,15 @@ export function MatchesShortlist({ jobId, matches, page, pageSize, reasons }: Pr
         {breakdown && (
           <div className="grid gap-4">
             <p className="text-fg-muted text-sm">{breakdown.summary}</p>
+            {breakdown.completeness !== null && (
+              <p className="text-fg-muted text-sm">
+                Profile completeness: {Math.round(breakdown.completeness * 100)}% of factors scored
+                from real data
+                {breakdown.thinProfile
+                  ? ' — thin profile, treat this score as weakly evidenced.'
+                  : '.'}
+              </p>
+            )}
             <ul className="grid gap-3">
               {breakdown.factors.map((f) => {
                 const pct = f.weight > 0 ? Math.round((f.score / f.weight) * 100) : 0;
@@ -390,6 +396,9 @@ export function MatchesShortlist({ jobId, matches, page, pageSize, reasons }: Pr
                     <div className="flex items-baseline justify-between gap-3">
                       <span className="text-fg text-sm font-medium">
                         {FACTOR_LABELS[f.factor] ?? f.factor}
+                        {!f.hasData && (
+                          <span className="text-fg-subtle font-normal"> · no data</span>
+                        )}
                       </span>
                       <span className="text-fg-subtle numeric text-xs">
                         {f.score.toFixed(1)} / {f.weight.toFixed(1)}

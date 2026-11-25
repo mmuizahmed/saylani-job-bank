@@ -18,12 +18,18 @@ import { Button, StatusPill } from '@/components/atoms';
 import { StatCard } from '@/components/molecules/StatCard';
 import { getMyProfile } from '@/domains/applicant';
 import { requireRole } from '@/domains/auth';
+import { listMatchedJobs } from '@/domains/matching';
 import { listMyNotifications } from '@/domains/notifications';
+import { listMyApplications } from '@/domains/placement';
+import { formatDate, formatDateTime } from '@/lib/format/date';
 import { formatPkMobileDisplay } from '@/lib/format/phone';
 import { APPLICANT_STATUS_PILL, IDENTITY_PILL } from '../_components/applicants/labels';
 import { StatusToggle } from './_components/StatusToggle';
 
 export const metadata = { title: 'My Dashboard — Saylani Job Bank' };
+
+/** Live data on every load — dashboards are never statically cached. */
+export const dynamic = 'force-dynamic';
 
 const STEP_FOR: Record<ProfileSectionId, string> = {
   personal: 'personal',
@@ -35,6 +41,18 @@ const STEP_FOR: Record<ProfileSectionId, string> = {
   preferences: 'preferences',
   documents: 'documents',
 };
+
+/**
+ * Application statuses with no further action possible. The "Active
+ * Applications" tile counts everything except these — rejected, refused,
+ * hired and staff-rejected applications are outcomes, not live applications.
+ */
+const TERMINAL_APPLICATION_STATUSES: readonly string[] = [
+  'EMPLOYER_REJECTED',
+  'APPLICANT_REFUSED',
+  'HIRED',
+  'REJECTED',
+];
 
 export default async function ApplicantHomePage() {
   const { actor, user } = await requireRole('APPLICANT');
@@ -120,18 +138,25 @@ export default async function ApplicantHomePage() {
 
   /* ── Dashboard ───────────────────────────────────────────── */
   const { completeness } = profile;
+  const [matchedJobs, myApplications] = await Promise.all([
+    profile.address ? listMatchedJobs(profile) : Promise.resolve([]),
+    listMyApplications(actor),
+  ]);
+
+  const upcomingInterviews = myApplications.filter(
+    (a) =>
+      a.status === 'INTERVIEW_SCHEDULED' && a.interviewAt && new Date(a.interviewAt) > new Date(),
+  );
+  const activeApplications = myApplications.filter(
+    (a) => !TERMINAL_APPLICATION_STATUSES.includes(a.status),
+  );
   const missingForActivation = completeness.sections.filter((s) =>
     completeness.activationMissing.includes(s.id),
   );
   const firstName = profile.personal.fullName.split(/\s+/)[0];
 
   const now = new Date();
-  const dateStr = now.toLocaleDateString('en-PK', {
-    weekday: 'short',
-    day: 'numeric',
-    month: 'long',
-    year: 'numeric',
-  });
+  const dateStr = `${now.toLocaleDateString('en-PK', { weekday: 'short' })}, ${formatDate(now)}`;
 
   return (
     <div className="grid w-full gap-6">
@@ -156,7 +181,7 @@ export default async function ApplicantHomePage() {
             </NextLink>
           </Button>
           <Button asChild variant="secondary" leftIcon={<UserRound />} size="sm">
-            <NextLink href="/applicant/profile">Edit profile</NextLink>
+            <NextLink href="/applicant/profile">My Profile</NextLink>
           </Button>
           <Button asChild variant="secondary" leftIcon={<FileText />} size="sm">
             <NextLink href="/applicant/documents">Documents</NextLink>
@@ -172,27 +197,89 @@ export default async function ApplicantHomePage() {
           icon={UserRound}
           tone="green"
           sub="Fill all sections"
-          spark={[20, 35, 50, 60, 65, 70, 80, completeness.percent]}
         />
         <StatCard
-          label="Applications"
-          value="—"
+          label="Active Applications"
+          value={activeApplications.length > 0 ? String(activeApplications.length) : '—'}
           icon={Briefcase}
           tone="blue"
-          sub="In pipeline (M10)"
+          sub={
+            myApplications.length > 0
+              ? `${myApplications.filter((a) => a.status === 'SHORTLISTED').length} shortlisted · ${myApplications.length} total`
+              : 'None yet'
+          }
         />
-        <StatCard label="Interviews" value="—" icon={Calendar} tone="amber" sub="Upcoming (M11)" />
+        <StatCard
+          label="Interviews"
+          value={upcomingInterviews.length > 0 ? String(upcomingInterviews.length) : '—'}
+          icon={Calendar}
+          tone="amber"
+          sub={upcomingInterviews.length > 0 ? 'Upcoming scheduled' : 'None scheduled'}
+        />
         <StatCard
           label="Job Matches"
-          value="—"
+          value={matchedJobs.length > 0 ? String(matchedJobs.length) : '—'}
           icon={MapPin}
           tone="teal"
-          sub="Near your area (M9)"
+          sub={
+            matchedJobs.length > 0
+              ? `${matchedJobs.filter((j) => j.strength === 'GREAT').length} great matches`
+              : profile.address
+                ? 'None yet in your city'
+                : 'Add location to see jobs'
+          }
         />
       </div>
 
+      {/* ── Application notifications ────────────────────────── */}
+      {upcomingInterviews.map((app) => (
+        <div
+          key={app.id}
+          className="flex items-start gap-3 rounded-2xl px-5 py-4 text-sm"
+          style={{
+            background: 'var(--warning-soft)',
+            color: 'var(--warning-soft-fg)',
+            border: '1px solid rgba(180,83,9,0.15)',
+          }}
+        >
+          <Calendar className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
+          <div>
+            <p className="font-semibold">Interview scheduled: {app.jobTitle}</p>
+            {app.interviewAt && (
+              <p className="mt-0.5">
+                {formatDateTime(app.interviewAt)}
+                {app.interviewLocation ? ` · ${app.interviewLocation}` : ''}
+              </p>
+            )}
+            {app.interviewNote && <p className="mt-0.5 opacity-80">{app.interviewNote}</p>}
+          </div>
+        </div>
+      ))}
+
+      {myApplications
+        .filter((a) => a.status === 'SHORTLISTED')
+        .map((app) => (
+          <div
+            key={app.id}
+            className="flex items-start gap-3 rounded-2xl px-5 py-4 text-sm"
+            style={{
+              background: 'var(--primary-soft)',
+              color: 'var(--primary-soft-fg)',
+              border: '1px solid rgba(26,95,172,0.15)',
+            }}
+          >
+            <Briefcase className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
+            <div>
+              <p className="font-semibold">You have been shortlisted: {app.jobTitle}</p>
+              <p className="mt-0.5 opacity-80">
+                at {app.companyName} — your branch will be in touch to confirm next steps.
+              </p>
+            </div>
+          </div>
+        ))}
+
       {/* ── Status alerts ────────────────────────────────────── */}
-      {profile.status === 'DRAFT' && missingForActivation.length > 0 && (
+      {missingForActivation.length > 0 && (
         <section
           aria-label="Profile incomplete"
           className="grid gap-3 rounded-2xl px-5 py-4 text-sm"
@@ -202,8 +289,8 @@ export default async function ApplicantHomePage() {
             border: '1px solid rgba(180,83,9,0.15)',
           }}
         >
-          <p className="font-semibold">Your profile is not live yet.</p>
-          <p>Complete these sections to start getting matched with jobs:</p>
+          <p className="font-semibold">Your profile is incomplete.</p>
+          <p>Complete these sections to finish setting up your profile:</p>
           <ul className="grid list-disc gap-1 pl-4">
             {missingForActivation.map((s) => (
               <li key={s.id}>

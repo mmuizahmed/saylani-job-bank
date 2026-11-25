@@ -6,7 +6,7 @@ import { and, desc, eq, gt, isNull, lt, sql } from 'drizzle-orm';
 import { recordAudit, runCommand, type RequestContext } from '@/domains/shared/audit';
 import { ConflictError, isUniqueViolation, ValidationError } from '@/domains/shared/errors';
 import { maskEmail } from '@/domains/shared/masking';
-import { enforceRateLimit } from '@/domains/shared/rate-limit';
+import { enforceRateLimit, enforceRateLimitByIp } from '@/domains/shared/rate-limit';
 import { db } from '@/lib/db';
 import { env } from '@/lib/env';
 import { sendMail } from '@/lib/mail/mailer';
@@ -14,7 +14,12 @@ import { signupCodeEmail, signupExistingAccountEmail } from '@/lib/mail/template
 import { setCredentialPassword } from './account-tokens';
 import { generateOtpCode } from './otp';
 import { getAuthSecret } from './secret';
-import { loginWithPassword, RESEND_AFTER_SECONDS, type SignInResult } from './service';
+import {
+  loginWithPassword,
+  RESEND_AFTER_SECONDS,
+  type SignInResult,
+  type TwoFactorSetupRequired,
+} from './service';
 
 /**
  * Employer self-registration (M7, owner decision 1): the employer confirms their email with
@@ -58,9 +63,9 @@ export async function requestEmployerSignupCode(ctx: RequestContext, rawEmail: s
     'Please wait a minute before requesting another code.',
   );
   await enforceRateLimit('signup-code', email, { limit: 5, windowSeconds: 3600 });
-  if (ctx.ip) {
-    await enforceRateLimit('signup-code-ip', ctx.ip, { limit: 20, windowSeconds: 3600 });
-  }
+  // Audit 2026-11-11 (M-17): a null IP used to skip this limit entirely —
+  // route through the helper so it lands in the shared 'untrusted' bucket.
+  await enforceRateLimitByIp(ctx.ip, 'signup-code-ip', { limit: 20, windowSeconds: 3600 });
 
   const existing = await emailTaken(email);
   if (existing) {
@@ -152,11 +157,10 @@ export async function signUpEmployer(
   ctx: RequestContext,
   input: EmployerSignupInput,
   requestHeaders: Headers,
-): Promise<SignInResult> {
+): Promise<SignInResult | TwoFactorSetupRequired> {
   const email = normalize(input.email);
-  if (ctx.ip) {
-    await enforceRateLimit('signup-ip', ctx.ip, { limit: 20, windowSeconds: 900 });
-  }
+  // Audit 2026-11-11 (M-17): see requestEmployerSignupCode above.
+  await enforceRateLimitByIp(ctx.ip, 'signup-ip', { limit: 20, windowSeconds: 900 });
   // Someone who can read this mailbox may learn that an account exists.
   if (await emailTaken(email)) throw alreadyRegistered();
 
@@ -190,7 +194,16 @@ export async function signUpEmployer(
     throw error;
   }
 
+  // A new employer has no authenticator yet, so — now that EMPLOYER is a
+  // 2FA-required role — this normally returns `two_factor_setup_required`
+  // with a setup token instead of a session; the signup form continues into
+  // enrolment with it. (Before 2026-11-15 this threw here, which would have
+  // failed every new employer signup once the role became 2FA-required.)
+  // A `two_factor_required` challenge is impossible for a fresh account —
+  // there is no authenticator to challenge with — so it stays a hard error.
   const result = await loginWithPassword(ctx, email, input.password, requestHeaders);
-  if (result.kind !== 'signed_in') throw new Error('A new employer account cannot have 2FA');
+  if (result.kind === 'two_factor_required') {
+    throw new Error('A new employer account cannot already have two-factor enabled');
+  }
   return result;
 }

@@ -1,13 +1,17 @@
 import 'server-only';
+import { verifyPassword } from 'better-auth/crypto';
 import { INTERNAL_ROLES, ROLES, type Role } from '@jobbank/shared';
 import { schema } from '@jobbank/db';
 import { and, asc, count, eq, exists, ilike, inArray, ne, or, sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import {
+  clearTrustedDevices,
   INVITE_TTL_DAYS,
+  invitationUrl,
   issueAccountToken,
   pendingInvitation,
   sendInvitationEmail,
+  voidAccountTokens,
 } from '@/domains/auth';
 import { runCommand, type RequestContext } from '@/domains/shared/audit';
 import {
@@ -15,9 +19,15 @@ import {
   ForbiddenError,
   NotFoundError,
   ScopeViolationError,
+  UnauthenticatedError,
   ValidationError,
 } from '@/domains/shared/errors';
 import { paginationMeta, type ListQuery } from '@/domains/shared/pagination';
+import { likeContains } from '@/domains/shared/filters';
+import { createNotification } from '@/domains/notifications';
+import { sendMail } from '@/lib/mail/mailer';
+import { twoFactorResetEmail } from '@/lib/mail/templates';
+import { enforceRateLimit } from '@/domains/shared/rate-limit';
 import { isSuperAdmin, type Actor } from '@/domains/shared/scope';
 import { db, type DbExecutor } from '@/lib/db';
 import { logger } from '@/lib/logger';
@@ -27,6 +37,8 @@ type SignedIn = RequestContext & { actor: Actor };
 
 const u = schema.users;
 const ur = schema.userRoles;
+const ap = schema.applicants;
+const cm = schema.companyMembers;
 
 export const STAFF_SORTABLE = ['name', 'createdAt', 'lastLoginAt'] as const;
 export const staffFilters = {
@@ -171,7 +183,7 @@ export async function listStaff(
   const where = and(
     membership,
     status ? eq(u.status, status) : undefined,
-    query.q ? or(ilike(u.name, `%${query.q}%`), ilike(u.email, `%${query.q}%`)) : undefined,
+    query.q ? or(ilike(u.name, likeContains(query.q)), ilike(u.email, likeContains(query.q))) : undefined,
   );
 
   const sortColumn = { name: u.name, createdAt: u.createdAt, lastLoginAt: u.lastLoginAt }[
@@ -278,18 +290,30 @@ async function actorName(executor: DbExecutor, actor: Actor): Promise<string> {
 
 export type InviteStaffInput = z.infer<typeof inviteStaffSchema>;
 
-/** Creates an INVITED account with one role and emails a set-password link. */
+/** Creates an INVITED account with one role and emails a set-password link.
+ * The link is also returned so the admin can copy/forward it by hand when
+ * the email does not arrive; it is the identical link the email carries. */
 export async function inviteStaff(
   ctx: SignedIn,
   input: InviteStaffInput,
-): Promise<{ user: StaffDetail; emailSent: boolean }> {
+): Promise<{ user: StaffDetail; emailSent: boolean; inviteLink: string }> {
   assertAllowed(canGrantRole(ctx.actor, input.role, input.branchId));
+  // Audit 2026-11-11 (L-29): a compromised user:manage account could
+  // mail-bomb an invitee indefinitely — 5 invites per actor + target
+  // email per hour. (A fresh key per call still sends a fresh email, so
+  // idempotency alone does not stop that.)
+  await enforceRateLimit(
+    'invite-send',
+    `${ctx.actor.userId}:${input.email.toLowerCase()}`,
+    { limit: 5, windowSeconds: 3600 },
+    'Too many invitations sent to this email. Try again later.',
+  );
 
   const invited = await runCommand(ctx, async ({ tx, audit }) => {
     const [existing] = await tx
       .select({ id: u.id })
       .from(u)
-      .where(eq(sql`lower(${u.email})`, input.email));
+      .where(eq(sql`lower(${u.email})`, input.email.toLowerCase()));
     if (existing) {
       throw new ConflictError(
         'An account with this email already exists. Open it and add a role instead.',
@@ -349,13 +373,30 @@ export async function inviteStaff(
       err,
     });
   }
-  return { user: await getStaffMember(ctx.actor, invited.user.id), emailSent };
+  return {
+    user: await getStaffMember(ctx.actor, invited.user.id),
+    emailSent,
+    inviteLink: invitationUrl(invited.token),
+  };
 }
 
 export async function resendInvitation(
   ctx: SignedIn,
   userId: string,
-): Promise<{ emailSent: boolean }> {
+): Promise<{ emailSent: boolean; inviteLink: string }> {
+  // Audit 2026-11-11 (L-29): 5 resends per actor + target per hour.
+  await enforceRateLimit(
+    'invite-resend',
+    `${ctx.actor.userId}:${userId}`,
+    { limit: 5, windowSeconds: 3600 },
+    'Too many invitation resends for this person. Try again later.',
+  );
+  // Short cooldown: a resend minutes after the last invite only spams
+  // the invitee and invalidates the link they may already hold.
+  const pending = await pendingInvitation(userId);
+  if (pending && Date.now() - pending.createdAt.getTime() < 5 * 60 * 1000) {
+    throw new ConflictError('An invitation was just sent. Wait a few minutes before resending.');
+  }
   const result = await runCommand(ctx, async ({ tx, audit }) => {
     const { row, assignments } = await loadTarget(tx, ctx.actor, userId);
     assertAllowed(canManageUser(ctx.actor, userId, assignments));
@@ -383,10 +424,34 @@ export async function resendInvitation(
       role: result.first.role,
       branchName: result.first.branchName,
     });
-    return { emailSent: true };
+    return { emailSent: true, inviteLink: invitationUrl(result.token) };
   } catch {
-    return { emailSent: false };
+    return { emailSent: false, inviteLink: invitationUrl(result.token) };
   }
+}
+
+/** Voids a pending invitation without issuing a new one. The link stops
+ * working at once; a fresh one can be sent afterwards with resend. */
+export async function revokeInvitation(
+  ctx: SignedIn,
+  userId: string,
+): Promise<{ revoked: boolean }> {
+  const result = await runCommand(ctx, async ({ tx, audit }) => {
+    const { row, assignments } = await loadTarget(tx, ctx.actor, userId);
+    assertAllowed(canManageUser(ctx.actor, userId, assignments));
+    if (row.status !== 'INVITED')
+      throw new ConflictError('This person has already activated their account');
+    const voided = await voidAccountTokens(tx, userId, 'INVITE');
+    audit({
+      action: 'user.invite_revoke',
+      entityType: 'user',
+      entityId: userId,
+      branchId: assignments[0]?.branchId ?? null,
+      after: { voided },
+    });
+    return { voided };
+  });
+  return { revoked: result.voided > 0 };
 }
 
 export async function grantRole(
@@ -397,7 +462,10 @@ export async function grantRole(
   assertAllowed(canGrantRole(ctx.actor, input.role, input.branchId));
   if (userId === ctx.actor.userId) throw new ForbiddenError('You cannot change your own roles');
   await runCommand(ctx, async ({ tx, audit }) => {
-    await loadTarget(tx, ctx.actor, userId);
+    const { assignments } = await loadTarget(tx, ctx.actor, userId);
+    // Seeing a user is not managing them: a Branch Admin may only grant roles
+    // onto accounts whose every role is inside their own branches (H7).
+    assertAllowed(canManageUser(ctx.actor, userId, assignments));
     await branchName(tx, input.branchId);
     const inserted = await tx
       .insert(ur)
@@ -429,6 +497,12 @@ export async function revokeRole(
   if (userId === ctx.actor.userId) throw new ForbiddenError('You cannot change your own roles');
   await runCommand(ctx, async ({ tx, audit }) => {
     const { assignments } = await loadTarget(tx, ctx.actor, userId);
+    // Audit 2026-11-11 (H-06): seeing a user is not managing them — mirror
+    // grantRole. canGrantRole alone is per-assignment, so without this a
+    // Branch Admin could revoke the STAFF/VERIFIER assignment of a user who
+    // is also a Branch Admin (or holds roles in branches the BA does not
+    // administer).
+    assertAllowed(canManageUser(ctx.actor, userId, assignments));
     const assignment = assignments.find((a) => a.id === assignmentId);
     if (!assignment) throw new NotFoundError('Role assignment', assignmentId);
     assertAllowed(canGrantRole(ctx.actor, assignment.role, assignment.branchId));
@@ -456,6 +530,9 @@ export async function setStaffStatus(
   userId: string,
   input: z.infer<typeof statusChangeSchema>,
 ): Promise<StaffDetail> {
+  // clearTrustedDevices uses the global db handle, so it runs after the
+  // transaction below (sessions are revoked inside it).
+  let disabled = false;
   await runCommand(ctx, async ({ tx, audit }) => {
     const { row, assignments } = await loadTarget(tx, ctx.actor, userId);
     assertAllowed(canManageUser(ctx.actor, userId, assignments));
@@ -466,8 +543,10 @@ export async function setStaffStatus(
       await assertNotLastSuperAdmin(tx, userId);
     }
     await tx.update(u).set({ status: input.status }).where(eq(u.id, userId));
-    if (input.status === 'DISABLED')
+    if (input.status === 'DISABLED') {
       await tx.delete(schema.sessions).where(eq(schema.sessions.userId, userId));
+      disabled = true;
+    }
     audit({
       action: input.status === 'DISABLED' ? 'user.disable' : 'user.enable',
       entityType: 'user',
@@ -478,6 +557,7 @@ export async function setStaffStatus(
       reason: input.reason,
     });
   });
+  if (disabled) await clearTrustedDevices(userId);
   return getStaffMember(ctx.actor, userId);
 }
 
@@ -486,21 +566,25 @@ export async function updateStaffProfile(
   userId: string,
   input: z.infer<typeof staffProfileSchema>,
 ): Promise<StaffDetail> {
-  await runCommand(ctx, async ({ tx, audit }) => {
-    const { row, assignments } = await loadTarget(tx, ctx.actor, userId);
-    assertAllowed(canManageUser(ctx.actor, userId, assignments));
-    const changes = Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined));
-    if (Object.keys(changes).length === 0) return;
-    await tx.update(u).set(changes).where(eq(u.id, userId));
-    audit({
-      action: 'user.update',
-      entityType: 'user',
-      entityId: userId,
-      branchId: assignments[0]?.branchId ?? null,
-      before: { name: row.name, title: row.title },
-      after: changes,
-    });
-  });
+  await runCommand(
+    ctx,
+    async ({ tx, audit }) => {
+      const { row, assignments } = await loadTarget(tx, ctx.actor, userId);
+      assertAllowed(canManageUser(ctx.actor, userId, assignments));
+      const changes = Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined));
+      if (Object.keys(changes).length === 0) return;
+      await tx.update(u).set(changes).where(eq(u.id, userId));
+      audit({
+        action: 'user.update',
+        entityType: 'user',
+        entityId: userId,
+        branchId: assignments[0]?.branchId ?? null,
+        before: { name: row.name, title: row.title },
+        after: changes,
+      });
+    },
+    { audited: false },
+  );
   return getStaffMember(ctx.actor, userId);
 }
 
@@ -511,6 +595,30 @@ export async function deleteStaff(ctx: SignedIn, userId: string, reason: string)
     assertAllowed(canManageUser(ctx.actor, userId, assignments));
     if (assignments.some((a) => a.role === 'SUPER_ADMIN')) {
       await assertNotLastSuperAdmin(tx, userId);
+    }
+    // Audit 2026-11-11 (L-32): applicants.userId and companyMembers.userId
+    // are onDelete: 'restrict', so deleting a dual-role user hit a bare FK
+    // 23503 and surfaced as a generic "related record still in use" 409.
+    // Pre-check and say which link blocks the delete instead.
+    const [applicant] = await tx
+      .select({ id: ap.id })
+      .from(ap)
+      .where(eq(ap.userId, userId))
+      .limit(1);
+    if (applicant) {
+      throw new ConflictError(
+        'This user has an applicant profile — remove the applicant link first',
+      );
+    }
+    const [membership] = await tx
+      .select({ companyId: cm.companyId })
+      .from(cm)
+      .where(eq(cm.userId, userId))
+      .limit(1);
+    if (membership) {
+      throw new ConflictError(
+        'This user is a member of a company — remove the company membership first',
+      );
     }
     audit({
       action: 'user.delete',
@@ -530,8 +638,30 @@ export async function resetStaffTwoFactor(
   ctx: SignedIn,
   userId: string,
   reason: string,
+  password: string,
 ): Promise<StaffDetail> {
-  await runCommand(ctx, async ({ tx, audit }) => {
+  // Audit 2026-11-11 (M-28): a 2FA reset is a security downgrade, so the
+  // acting admin must re-enter their own password — a stolen session alone
+  // must not be enough. Verified server-side against the actor's credential
+  // account, same as the login blocked-account check (auth/service.ts). The
+  // password is never logged or stored. Full dual-admin approval would need
+  // a pending-requests table + a new migration; recorded as a follow-up in
+  // the fix log, not built here.
+  const [account] = await db
+    .select({ password: schema.accounts.password })
+    .from(schema.accounts)
+    .where(
+      and(
+        eq(schema.accounts.userId, ctx.actor.userId),
+        eq(schema.accounts.providerId, 'credential'),
+      ),
+    );
+  if (!account?.password || !(await verifyPassword({ hash: account.password, password }))) {
+    throw new UnauthenticatedError('Incorrect password');
+  }
+  // The victim's contact details, returned from the transaction for the
+  // post-commit notification below (M-28).
+  const victim = await runCommand(ctx, async ({ tx, audit }) => {
     const { row, assignments } = await loadTarget(tx, ctx.actor, userId);
     assertAllowed(canManageUser(ctx.actor, userId, assignments));
     if (!row.twoFactorEnabled)
@@ -546,6 +676,26 @@ export async function resetStaffTwoFactor(
       branchId: assignments[0]?.branchId ?? null,
       reason,
     });
+    return { name: row.name, email: row.email };
   });
+  // clearTrustedDevices uses the global db handle, so it runs after the
+  // transaction above (sessions are revoked inside it).
+  await clearTrustedDevices(userId);
+  // Audit 2026-11-11 (M-28): a 2FA reset is a security downgrade the victim
+  // must hear about — in-app notification plus email, best-effort. (The
+  // second-admin-approval part is still a design decision; see the fix log.)
+  void (async () => {
+    await createNotification(db, {
+      userId,
+      type: 'TWO_FACTOR_RESET',
+      title: 'Your authenticator was removed',
+      body: `An administrator removed two-factor authentication from your account. Reason: ${reason}. You will need to set it up again at your next sign-in — if you did not ask for this, contact your branch admin immediately.`,
+      data: { reason },
+    });
+    await sendMail({
+      to: victim.email,
+      ...twoFactorResetEmail({ name: victim.name, reason }),
+    });
+  })().catch((err) => logger.error('2fa reset victim notification failed', { userId, err }));
   return getStaffMember(ctx.actor, userId);
 }

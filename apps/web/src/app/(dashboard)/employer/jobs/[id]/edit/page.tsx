@@ -12,6 +12,8 @@ export default async function EditJobPage({ params }: { params: Promise<{ id: st
 
   try {
     const job = await getMyJob(actor, id);
+    // 2026-11-12: the company may fully edit its own job in any editable
+    // status — the old published-job field restrictions were lifted.
     return <JobWizard initialJob={job} />;
   } catch (e) {
     if (e instanceof NotFoundError) return notFound();

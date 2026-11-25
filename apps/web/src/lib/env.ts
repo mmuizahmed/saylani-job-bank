@@ -24,11 +24,42 @@ export const env = createEnv({
     SMTP_SECURE: z.stringbool().default(false),
     // 'memory' keeps emails in-process (tests); 'smtp' sends them (Mailpit locally).
     MAIL_TRANSPORT: z.enum(['smtp', 'memory']).default('smtp'),
-    // ≥32 random chars; signs sessions and keys OTP hashes. Required in production
-    // (lib/auth falls back to a fixed development secret only outside production).
+    // ≥32 random chars; signs sessions and keys OTP hashes. Required in every
+    // environment — there is no dev fallback secret (see domains/auth/secret.ts).
+    // Generate with: openssl rand -base64 32
     BETTER_AUTH_SECRET: z.string().min(32).optional(),
     // SMS gateway for OTP codes. 'console' prints codes to the server log (development only).
     SMS_PROVIDER: z.enum(['console']).default('console'),
+    OPENCAGE_API_KEY: z.string().optional(),
+    /**
+     * How many reverse proxies sit in front of the app (default 1). Client IPs are
+     * taken from the right-hand TRUSTED_PROXY_HOPS entries of X-Forwarded-For only
+     * (see lib/http/client-ip.ts) — the left-hand entries are client-controlled.
+     * Set this to the real proxy count of the deployment (e.g. 2 behind
+     * Cloudflare + nginx, 1 behind a single nginx). If it is larger than the
+     * chain the app actually sees, no trustworthy IP can be determined and
+     * IP-based rate limits fall back to a shared bucket (fail-closed).
+     * Local dev has no proxy, so direct connections get no trustworthy IP.
+     */
+    TRUSTED_PROXY_HOPS: z.coerce.number().int().min(1).max(10).default(1),
+    /**
+     * Optional shared secret for non-browser automation that must make
+     * cookie-authenticated writes (e.g. an unattended smoke test): sent as
+     * the `x-internal-write-token` header. The CSRF check (L-13) accepts it
+     * in production in place of an Origin header. Leave unset unless such
+     * automation exists — an unset value means no bypass exists.
+     */
+    INTERNAL_WRITE_TOKEN: z.string().min(1).optional(),
+    /**
+     * Optional shared secret for the unattended job-expiry scheduler
+     * (audit 2026-11-11, L-05): sent as the `x-cron-secret` header to
+     * POST /api/v1/admin/maintenance/expire-jobs. A scheduler cannot hold a
+     * user session, so the Super Admin role gate alone cannot authenticate
+     * it. Leave unset unless a scheduler exists — an unset value means no
+     * cron bypass exists and only a signed-in Super Admin may expire jobs.
+     * Generate with: openssl rand -base64 32
+     */
+    CRON_SECRET: z.string().min(1).optional(),
   },
   client: {
     NEXT_PUBLIC_APP_URL: z.url(),

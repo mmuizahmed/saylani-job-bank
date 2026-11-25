@@ -18,6 +18,13 @@ export const MASTER_DATA_TYPES = [
   'VERIFICATION_REJECTION_REASON',
   'WITHDRAWAL_REASON',
   'INDUSTRY',
+  /**
+   * Designations with their salary range (job posting form, 2026-11-10):
+   * a job's salary must fall inside its designation's range, when a range
+   * is stored. No rows are seeded — the user supplies the designation
+   * list and ranges; Super Admin adds them in master data.
+   */
+  'DESIGNATION',
 ] as const;
 
 export type MasterDataType = (typeof MASTER_DATA_TYPES)[number];
@@ -36,6 +43,7 @@ export const MASTER_DATA_TYPE_LABELS: Record<MasterDataType, string> = {
   VERIFICATION_REJECTION_REASON: 'Company verification rejection reasons',
   WITHDRAWAL_REASON: 'Match withdrawal reasons',
   INDUSTRY: 'Industries',
+  DESIGNATION: 'Designations',
 };
 
 /** Which type an item's parent must be, and whether a parent is required. */
@@ -108,7 +116,19 @@ export const MASTER_DATA_META = {
   AREA: z.strictObject({}),
   DOCUMENT_TYPE: z.strictObject({
     appliesTo: z.enum(['APPLICANT', 'COMPANY']),
+    /** Globally required — must be uploaded by every applicant, regardless of category. */
     required: z.boolean(),
+    /**
+     * Category-conditional requirement. If the applicant has selected any of these
+     * JOB_CATEGORY codes in their preferences, this document becomes required for them.
+     * e.g. ['DRIVING'] makes a driving licence mandatory for applicants seeking driving jobs.
+     */
+    requiredForCategories: z.array(masterDataCodeSchema).default([]),
+    /**
+     * Alternative requirement. For each selected category, at least one document type
+     * listing that category must be uploaded (e.g. a healthcare licence OR degree).
+     */
+    requiredAlternativeForCategories: z.array(masterDataCodeSchema).default([]),
     mimeTypes: z.array(z.enum(DOCUMENT_MIME_TYPES)).min(1),
     maxSizeMb: z.number().int().min(1).max(20),
     /** Several files of this type may be kept (certificates); otherwise a new upload replaces. */
@@ -122,6 +142,11 @@ export const MASTER_DATA_META = {
   VERIFICATION_REJECTION_REASON: reasonMeta,
   WITHDRAWAL_REASON: reasonMeta,
   INDUSTRY: z.strictObject({}),
+  DESIGNATION: z.strictObject({
+    /** Monthly salary range (PKR) for this designation; either end may be left unset. */
+    salaryMin: z.number().int().min(0).max(10_000_000).optional(),
+    salaryMax: z.number().int().min(0).max(10_000_000).optional(),
+  }),
 } as const satisfies Record<MasterDataType, z.ZodType>;
 
 export type MasterDataMeta<T extends MasterDataType> = z.infer<(typeof MASTER_DATA_META)[T]>;

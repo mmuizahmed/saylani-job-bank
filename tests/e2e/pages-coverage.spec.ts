@@ -9,7 +9,11 @@ import { expect, test } from '@playwright/test';
  * is what a broken query/param binding violates.
  */
 
-const DEV_PASSWORD = 'JobBank-Dev-2026!';
+const DEV_PASSWORD = process.env.SEED_DEV_PASSWORD ?? '';
+if (!DEV_PASSWORD)
+  throw new Error(
+    'SEED_DEV_PASSWORD must be set in .env (see .env.example) — local dev seed password, never production.',
+  );
 const MISSING_UUID = '00000000-0000-0000-0000-000000000000';
 
 async function signIn(page: import('@playwright/test').Page, email: string) {
@@ -53,49 +57,62 @@ test.describe('applicant area', () => {
 
 test.describe('detail routes never 5xx', () => {
   test('staff detail pages', async ({ page }) => {
-    await sweep(page, 'staff.khi@jobbank.local', [
-      `/staff/applicants/${MISSING_UUID}`,
-    ], 'staff');
+    await sweep(page, 'staff.khi@jobbank.local', [`/staff/applicants/${MISSING_UUID}`], 'staff');
   });
 
   test('super admin detail pages', async ({ page }) => {
-    await sweep(page, 'superadmin@jobbank.local', [
-      '/super-admin/applicants',
-      `/super-admin/applicants/${MISSING_UUID}`,
-      `/super-admin/branches/${MISSING_UUID}`,
-      `/super-admin/companies/${MISSING_UUID}`,
-      `/super-admin/jobs/${MISSING_UUID}`,
-      `/super-admin/staff/${MISSING_UUID}`,
-    ], 'super-admin');
+    await sweep(
+      page,
+      'superadmin@jobbank.local',
+      [
+        '/super-admin/applicants',
+        `/super-admin/applicants/${MISSING_UUID}`,
+        `/super-admin/branches/${MISSING_UUID}`,
+        `/super-admin/companies/${MISSING_UUID}`,
+        `/super-admin/jobs/${MISSING_UUID}`,
+        `/super-admin/staff/${MISSING_UUID}`,
+      ],
+      'super-admin',
+    );
   });
 
   test('employer detail pages', async ({ page }) => {
-    await sweep(page, 'employer@jobbank.local', [
-      `/employer/jobs/${MISSING_UUID}`,
-      `/employer/jobs/${MISSING_UUID}/edit`,
-    ], 'employer');
+    await sweep(
+      page,
+      'employer@jobbank.local',
+      [`/employer/jobs/${MISSING_UUID}`, `/employer/jobs/${MISSING_UUID}/edit`],
+      'employer',
+    );
   });
 
   test('branch-admin area', async ({ page }) => {
-    await sweep(page, 'superadmin@jobbank.local', [
-      '/branch-admin',
-      '/branch-admin/applicants',
-      `/branch-admin/applicants/${MISSING_UUID}`,
-      '/branch-admin/companies',
-      '/branch-admin/companies/new',
-      `/branch-admin/companies/${MISSING_UUID}`,
-      '/branch-admin/jobs',
-      '/branch-admin/jobs/new',
-      `/branch-admin/jobs/${MISSING_UUID}`,
-      '/branch-admin/settings',
-      '/branch-admin/staff',
-      `/branch-admin/staff/${MISSING_UUID}`,
-    ], 'branch-admin');
+    await sweep(
+      page,
+      'superadmin@jobbank.local',
+      [
+        '/branch-admin',
+        '/branch-admin/applicants',
+        `/branch-admin/applicants/${MISSING_UUID}`,
+        '/branch-admin/companies',
+        '/branch-admin/companies/new',
+        `/branch-admin/companies/${MISSING_UUID}`,
+        '/branch-admin/jobs',
+        '/branch-admin/jobs/new',
+        `/branch-admin/jobs/${MISSING_UUID}`,
+        '/branch-admin/settings',
+        '/branch-admin/staff',
+        `/branch-admin/staff/${MISSING_UUID}`,
+      ],
+      'branch-admin',
+    );
   });
 
   test('verifier detail page', async ({ page }) => {
-    await sweep(page, 'verifier.khi@jobbank.local', [
-      `/verifier/queue/${MISSING_UUID}`,
-    ], 'verifier');
+    await sweep(
+      page,
+      'verifier.khi@jobbank.local',
+      [`/verifier/queue/${MISSING_UUID}`],
+      'verifier',
+    );
   });
 });

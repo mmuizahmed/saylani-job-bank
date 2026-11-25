@@ -1,15 +1,16 @@
 import { schema } from '@jobbank/db';
-import { DEV_PASSWORD } from '@jobbank/db/seed/dev-data';
-import { and, desc, eq } from 'drizzle-orm';
+import { getSeedDevPassword } from '@jobbank/db/seed/dev-data';
+import { hashPassword } from 'better-auth/crypto';
+import { and, eq, like } from 'drizzle-orm';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { POST as confirm2fa } from '@/app/api/v1/account/2fa/confirm/route';
 import { POST as disable2fa } from '@/app/api/v1/account/2fa/disable/route';
 import { POST as enroll2fa } from '@/app/api/v1/account/2fa/enroll/route';
 import { POST as verify2fa } from '@/app/api/v1/auth/2fa/verify/route';
-import { POST as emailCodeRequest } from '@/app/api/v1/auth/email-otp/request/route';
-import { POST as emailCodeVerify } from '@/app/api/v1/auth/email-otp/verify/route';
 import { POST as acceptInvite } from '@/app/api/v1/auth/invitations/accept/route';
 import { GET as lookupInvite } from '@/app/api/v1/auth/invitations/lookup/route';
+import { POST as signupCode } from '@/app/api/v1/auth/signup/code/route';
+import { POST as signupComplete } from '@/app/api/v1/auth/signup/complete/route';
 import { POST as login } from '@/app/api/v1/auth/login/route';
 import { GET as me } from '@/app/api/v1/auth/me/route';
 import { POST as forgot } from '@/app/api/v1/auth/password/forgot/route';
@@ -17,6 +18,7 @@ import { POST as reset } from '@/app/api/v1/auth/password/reset/route';
 import { PATCH as patchBranch } from '@/app/api/v1/branches/[id]/route';
 import { GET as listBranchesRoute, POST as createBranchRoute } from '@/app/api/v1/branches/route';
 import { POST as resendInvite } from '@/app/api/v1/users/[id]/invitation/route';
+import { POST as revokeInvite } from '@/app/api/v1/users/[id]/invitation/revoke/route';
 import { DELETE as revokeRoleRoute } from '@/app/api/v1/users/[id]/roles/[assignmentId]/route';
 import { POST as grantRoleRoute } from '@/app/api/v1/users/[id]/roles/route';
 import { GET as getUser } from '@/app/api/v1/users/[id]/route';
@@ -30,9 +32,12 @@ import {
   call,
   enrollTwoFactor,
   Jar,
+  owner,
+  rememberTotp,
   resetTwoFactor,
   signIn,
   signInAdmin,
+  signInWith2fa,
   totpCode,
   uniqueEmail,
 } from '@/test/api-client';
@@ -61,7 +66,11 @@ beforeAll(async () => {
 beforeEach(() => resetMemoryRateLimits());
 
 /** Invites + activates a staff member through the real flow; returns their id and session. */
-async function inviteAndActivate(adminJar: Jar, role: 'STAFF' | 'VERIFIER', branch: string) {
+async function inviteAndActivate(
+  adminJar: Jar,
+  role: 'STAFF' | 'VERIFIER' | 'INTERVIEWER_SCHEDULER',
+  branch: string,
+) {
   const email = uniqueEmail('staff');
   const invited = await call(inviteRoute, '/api/v1/users', {
     method: 'POST',
@@ -74,10 +83,17 @@ async function inviteAndActivate(adminJar: Jar, role: 'STAFF' | 'VERIFIER', bran
   const jar = new Jar();
   const accepted = await call(acceptInvite, '/api/v1/auth/invitations/accept', {
     method: 'POST',
-    body: { token, password: DEV_PASSWORD },
+    body: { token, password: getSeedDevPassword() },
     jar,
   });
   expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+  // Staff, Verifiers and Interviewer-Schedulers must enrol an authenticator
+  // before use, so activation returns a setup token instead of a session —
+  // enrol here so the caller gets a live session.
+  if (accepted.body.data.kind === 'two_factor_setup_required') {
+    jar.setupToken = accepted.body.data.setupToken as string;
+    await enrollTwoFactor(email, jar);
+  }
   return { id: invited.body.data.user.id as string, email, jar };
 }
 
@@ -87,24 +103,26 @@ describe('two-factor authentication', () => {
   it('Super Admin is blocked until enrolment, then needs a code at every sign-in', async () => {
     const email = 'superadmin@jobbank.local';
     await resetTwoFactor(email);
+    // H-02: a never-enrolled 2FA-required admin gets no session at login —
+    // only a short-lived setup token. Protected routes see no session (401),
+    // and enrolment is the only thing the token buys.
     const jar = await signIn(email);
+    expect(jar.setupToken?.startsWith('v1.')).toBe(true);
 
     const blocked = await call(listBranchesRoute, '/api/v1/branches', { jar });
-    expect(blocked.status).toBe(403);
-    expect(blocked.body.error.details).toEqual({ reason: 'TWO_FACTOR_SETUP_REQUIRED' });
-    expect((await call(me, '/api/v1/auth/me', { jar })).body.data.twoFactorPending).toBe(true);
+    expect(blocked.status).toBe(401);
 
     const badPassword = await call(enroll2fa, '/api/v1/account/2fa/enroll', {
       method: 'POST',
       jar,
-      body: { password: 'wrong-password-1' },
+      body: { password: 'wrong-password-1', setupToken: jar.setupToken },
     });
     expect(badPassword.status).toBe(401);
 
     const start = await call(enroll2fa, '/api/v1/account/2fa/enroll', {
       method: 'POST',
       jar,
-      body: { password: DEV_PASSWORD },
+      body: { password: getSeedDevPassword(), setupToken: jar.setupToken },
     });
     expect(start.status).toBe(200);
     expect(start.body.data.qrSvg).toMatch(/^<svg/);
@@ -124,7 +142,7 @@ describe('two-factor authentication', () => {
     const step1 = new Jar();
     const pw = await call(login, '/api/v1/auth/login', {
       method: 'POST',
-      body: { email, password: DEV_PASSWORD },
+      body: { email, password: getSeedDevPassword() },
       jar: step1,
     });
     expect(pw.body.data).toMatchObject({ kind: 'two_factor_required', methods: ['totp'] });
@@ -153,7 +171,7 @@ describe('two-factor authentication', () => {
       const j = new Jar();
       await call(login, '/api/v1/auth/login', {
         method: 'POST',
-        body: { email, password: DEV_PASSWORD },
+        body: { email, password: getSeedDevPassword() },
         jar: j,
       });
       return call(verify2fa, '/api/v1/auth/2fa/verify', {
@@ -166,41 +184,107 @@ describe('two-factor authentication', () => {
     expect((await viaBackup()).status).toBe(401);
   });
 
-  it('admins cannot turn two-factor off; other staff can opt in and out', async () => {
+  it('an invitee enrols with their setup token even when an admin session is live', async () => {
+    // Regression 2026-11-16: the enrol route used to prefer the session
+    // cookie over the setupToken, so an admin testing an invite in the same
+    // browser had the invitee's password checked against the admin's account
+    // and a correct password failed with "Incorrect password".
+    const adminJar = await signInAdmin('superadmin@jobbank.local');
+    const email = uniqueEmail('staff');
+    const invited = await call(inviteRoute, '/api/v1/users', {
+      method: 'POST',
+      jar: adminJar,
+      headers: { 'idempotency-key': crypto.randomUUID() },
+      body: { name: 'Test Staff', email, title: 'Placement Officer', role: 'STAFF', branchId: KHI },
+    });
+    expect(invited.status, JSON.stringify(invited.body)).toBe(201);
+    const token = tokenFrom(lastMailTo(email).text);
+    // The invitee chooses a password unlike any seeded account's, so a check
+    // against the wrong account cannot pass by accident.
+    const staffPassword = 'Invitee-only-99';
+    const jar = new Jar();
+    const accepted = await call(acceptInvite, '/api/v1/auth/invitations/accept', {
+      method: 'POST',
+      body: { token, password: staffPassword },
+      jar,
+    });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    expect(accepted.body.data.kind).toBe('two_factor_setup_required');
+    const setupToken = accepted.body.data.setupToken as string;
+
+    // The admin session is still live in this browser — enrolment must still
+    // run against the invitee's account, via the setup token.
+    const start = await call(enroll2fa, '/api/v1/account/2fa/enroll', {
+      method: 'POST',
+      jar: adminJar,
+      body: { password: staffPassword, setupToken },
+    });
+    expect(start.status, JSON.stringify(start.body)).toBe(200);
+    expect(start.body.data.qrSvg).toMatch(/^<svg/);
+    expect(start.body.data.backupCodes).toHaveLength(10);
+
+    // The enrolment belongs to the invitee: confirming it signs the invitee
+    // in, not the admin whose session was on the request.
+    rememberTotp(email, start.body.data.manualKey);
+    const done = await call(confirm2fa, '/api/v1/account/2fa/confirm', {
+      method: 'POST',
+      jar: adminJar,
+      body: { code: totpCode(email) },
+    });
+    expect(done.status, JSON.stringify(done.body)).toBe(200);
+    expect((await call(me, '/api/v1/auth/me', { jar: adminJar })).body.data.user.email).toBe(email);
+  });
+
+  it('invited Verifier and Interviewer-Scheduler must enrol an authenticator before use', async () => {
+    // Regression 2026-11-23: both roles used to sign straight in after
+    // accepting an invite (2FA was optional for them), so the setup screen
+    // never appeared for them.
+    const adminJar = await signInAdmin('superadmin@jobbank.local');
+    for (const role of ['VERIFIER', 'INTERVIEWER_SCHEDULER'] as const) {
+      const email = uniqueEmail('invitee2fa');
+      const invited = await call(inviteRoute, '/api/v1/users', {
+        method: 'POST',
+        jar: adminJar,
+        headers: { 'idempotency-key': crypto.randomUUID() },
+        body: { name: 'Test Invitee', email, title: 'Officer', role, branchId: KHI },
+      });
+      expect(invited.status, JSON.stringify(invited.body)).toBe(201);
+      const token = tokenFrom(lastMailTo(email).text);
+      const accepted = await call(acceptInvite, '/api/v1/auth/invitations/accept', {
+        method: 'POST',
+        body: { token, password: getSeedDevPassword() },
+      });
+      expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+      expect(accepted.body.data.kind).toBe('two_factor_setup_required');
+    }
+  });
+
+  it('no password role can turn two-factor off', async () => {
+    // Branch Admin and Verifier alike: enrolment is mandatory, so disabling
+    // is forbidden for both. (Before the 2026-11-23 extension, Verifiers
+    // could opt in and out.)
     const admin = await signInAdmin('branchadmin.khi@jobbank.local');
     const refused = await call(disable2fa, '/api/v1/account/2fa/disable', {
       method: 'POST',
       jar: admin,
-      body: { password: DEV_PASSWORD },
+      body: { password: getSeedDevPassword() },
     });
     expect(refused.status).toBe(403);
 
-    const email = 'verifier.khi@jobbank.local';
-    await resetTwoFactor(email);
-    const jar = await signIn(email);
-    expect((await call(me, '/api/v1/auth/me', { jar })).body.data.twoFactorPending).toBe(false);
-    await enrollTwoFactor(email, jar);
-    expect(
-      (
-        await call(disable2fa, '/api/v1/account/2fa/disable', {
-          method: 'POST',
-          jar,
-          body: { password: DEV_PASSWORD },
-        })
-      ).status,
-    ).toBe(200);
-    const after = await call(login, '/api/v1/auth/login', {
+    const verifier = await signInAdmin('verifier.khi@jobbank.local');
+    const refusedVerifier = await call(disable2fa, '/api/v1/account/2fa/disable', {
       method: 'POST',
-      body: { email, password: DEV_PASSWORD },
+      jar: verifier,
+      body: { password: getSeedDevPassword() },
     });
-    expect(after.body.data.kind).toBe('signed_in');
+    expect(refusedVerifier.status).toBe(403);
   });
 });
 
 // ─── Branches ─────────────────────────────────────────────────────────
 
 describe('branch management', () => {
-  it('Super Admin creates (idempotently) and edits branches; codes are unique and permanent', async () => {
+  it('Super Admin creates (idempotently) and edits branches; codes are unique and Super Admin-editable', async () => {
     const jar = await signInAdmin('superadmin@jobbank.local');
     const code = `T-${crypto.randomUUID().slice(0, 6).toUpperCase()}`;
     const key = crypto.randomUUID();
@@ -209,7 +293,6 @@ describe('branch management', () => {
       name: 'Test Branch',
       city: 'Hyderabad',
       location: { lat: 25.396, lng: 68.3578 },
-      matchRadius: { preferredM: 6000, maxM: 8000 },
     };
     const create = () =>
       call(createBranchRoute, '/api/v1/branches', {
@@ -227,7 +310,6 @@ describe('branch management', () => {
       code,
       staffCount: 0,
       location: { lat: 25.396, lng: 68.3578 },
-      matchRadius: { preferredM: 6000, maxM: 8000, source: 'BRANCH' },
     });
 
     const dup = await call(createBranchRoute, '/api/v1/branches', {
@@ -239,18 +321,43 @@ describe('branch management', () => {
     expect(dup.status).toBe(409);
 
     const id = first.body.data.id;
+    // Branch codes are editable by Super Admin only (Step 2, 2026-11-12):
+    // a new unique code is accepted and returned. Changing a code breaks
+    // already-issued token slips, so this throwaway branch is the right place.
+    const newCode = `T-${crypto.randomUUID().slice(0, 6).toUpperCase()}`;
     const renamed = await call(patchBranch, `/api/v1/branches/${id}`, {
       method: 'PATCH',
       jar,
       params: { id },
-      body: { name: 'Test Branch Renamed', code: 'HACKED' },
+      body: { name: 'Test Branch Renamed', code: newCode },
     });
-    // A partial update must not reset unrelated fields (regression: radius default leaked into PATCH).
+    expect(renamed.status, JSON.stringify(renamed.body)).toBe(200);
+    // A partial update must not reset unrelated fields.
     expect(renamed.body.data).toMatchObject({
       name: 'Test Branch Renamed',
-      code,
-      matchRadius: { maxM: 8000, source: 'BRANCH' },
+      code: newCode,
+      city: 'Hyderabad',
+      location: { lat: 25.396, lng: 68.3578 },
     });
+
+    // A code that already belongs to another branch is refused.
+    const duplicate = await call(patchBranch, `/api/v1/branches/${id}`, {
+      method: 'PATCH',
+      jar,
+      params: { id },
+      body: { code: 'KHI-GULSHAN' },
+    });
+    expect(duplicate.status).toBe(409);
+
+    // A Branch Admin cannot edit a branch code at all (branch:manage is Super Admin only).
+    const ba = await signInAdmin('branchadmin.khi@jobbank.local');
+    const denied = await call(patchBranch, `/api/v1/branches/${id}`, {
+      method: 'PATCH',
+      jar: ba,
+      params: { id },
+      body: { code: `T-${crypto.randomUUID().slice(0, 6).toUpperCase()}` },
+    });
+    expect(denied.status).toBe(403);
 
     // Re-saving identical values (the form sends every field) writes no audit row.
     const auditCount = async () =>
@@ -273,15 +380,6 @@ describe('branch management', () => {
     });
     expect(await auditCount()).toBe(rowsBefore);
 
-    // Switching the branch back to the global radius removes its own policy.
-    const inherited = await call(patchBranch, `/api/v1/branches/${id}`, {
-      method: 'PATCH',
-      jar,
-      params: { id },
-      body: { matchRadius: null },
-    });
-    expect(inherited.body.data.matchRadius.source).toBe('GLOBAL');
-
     await call(patchBranch, `/api/v1/branches/${id}`, {
       method: 'PATCH',
       jar,
@@ -297,22 +395,7 @@ describe('branch management', () => {
     expect(audit?.before).toEqual({ isActive: true });
   });
 
-  it('rejects radius beyond the PRD 10 km cap, and non-Super-Admins', async () => {
-    const jar = await signInAdmin('superadmin@jobbank.local');
-    const tooFar = await call(createBranchRoute, '/api/v1/branches', {
-      method: 'POST',
-      jar,
-      headers: { 'idempotency-key': crypto.randomUUID() },
-      body: {
-        code: 'TOO-FAR',
-        name: 'X',
-        city: 'Y',
-        location: { lat: 24, lng: 67 },
-        matchRadius: { preferredM: 8000, maxM: 15_000 },
-      },
-    });
-    expect(tooFar.status).toBe(422);
-
+  it('rejects branch edits by non-Super-Admins', async () => {
     const ba = await signInAdmin('branchadmin.khi@jobbank.local');
     const denied = await call(patchBranch, `/api/v1/branches/${KHI}`, {
       method: 'PATCH',
@@ -343,6 +426,8 @@ describe('staff invitations', () => {
     expect(mail.subject).toMatch(/invited/i);
     const token = tokenFrom(mail.text);
     expect(token.length).toBeGreaterThan(30);
+    // The link returned to the admin is the identical link the email carries.
+    expect(tokenFrom(invited.body.data.inviteLink as string)).toBe(token);
     const [stored] = await db
       .select()
       .from(schema.accountTokens)
@@ -365,7 +450,10 @@ describe('staff invitations', () => {
       body: { token, password: 'Strong-pass-123' },
     });
     expect(ok.status).toBe(200);
-    expect(ok.body.data).toMatchObject({ kind: 'signed_in', homePath: '/staff' });
+    // Staff must enrol before they hold a session (same rule as inviteAndActivate).
+    expect(ok.body.data.kind).toBe('two_factor_setup_required');
+    jar.setupToken = ok.body.data.setupToken as string;
+    await enrollTwoFactor(email, jar, 'Strong-pass-123');
     expect(
       (await call(me, '/api/v1/auth/me', { jar })).body.data.branches.map(
         (b: { id: string }) => b.id,
@@ -407,6 +495,49 @@ describe('staff invitations', () => {
     ).toBe(409);
   });
 
+  it('Super Admin and Branch Admin can invite an Interviewer and Scheduler into a branch', async () => {
+    // Regression: the user_roles_branch_scope check once omitted
+    // INTERVIEWER_SCHEDULER, so these invites passed the permission check
+    // and then failed in Postgres with 23514 ("Scope is not allowed.").
+    const sa = await signInAdmin('superadmin@jobbank.local');
+    const saEmail = uniqueEmail('interviewer-sa');
+    const saInvite = await call(inviteRoute, '/api/v1/users', {
+      method: 'POST',
+      jar: sa,
+      headers: { 'idempotency-key': crypto.randomUUID() },
+      body: {
+        name: 'Sara Interviewer',
+        email: saEmail,
+        title: 'Interviewer Officer',
+        role: 'INTERVIEWER_SCHEDULER',
+        branchId: KHI,
+      },
+    });
+    expect(saInvite.status, JSON.stringify(saInvite.body)).toBe(201);
+
+    const ba = await signInAdmin('branchadmin.khi@jobbank.local');
+    const baEmail = uniqueEmail('interviewer-ba');
+    const baInvite = await call(inviteRoute, '/api/v1/users', {
+      method: 'POST',
+      jar: ba,
+      headers: { 'idempotency-key': crypto.randomUUID() },
+      body: {
+        name: 'Bilal Interviewer',
+        email: baEmail,
+        title: 'Interviewer Officer',
+        role: 'INTERVIEWER_SCHEDULER',
+        branchId: KHI,
+      },
+    });
+    expect(baInvite.status, JSON.stringify(baInvite.body)).toBe(201);
+
+    const [stored] = await db
+      .select()
+      .from(schema.userRoles)
+      .where(eq(schema.userRoles.userId, baInvite.body.data.user.id));
+    expect(stored).toMatchObject({ roleCode: 'INTERVIEWER_SCHEDULER', branchId: KHI });
+  });
+
   it('a resent invitation replaces the old link', async () => {
     const sa = await signInAdmin('superadmin@jobbank.local');
     const email = uniqueEmail('resend');
@@ -416,24 +547,71 @@ describe('staff invitations', () => {
       headers: { 'idempotency-key': crypto.randomUUID() },
       body: { name: 'Re Send', email, role: 'VERIFIER', branchId: LHR },
     });
+    expect(invited.status, JSON.stringify(invited.body)).toBe(201);
     const firstToken = tokenFrom(lastMailTo(email).text);
     const id = invited.body.data.user.id;
-    expect(
-      (
-        await call(resendInvite, `/api/v1/users/${id}/invitation`, {
-          method: 'POST',
-          jar: sa,
-          params: { id },
-        })
-      ).status,
-    ).toBe(200);
+    // Round 2: L-29 refuses a resend within 5 minutes of the invite — age
+    // the pending invite past the cooldown, as a real resend would be.
+    await owner`UPDATE account_tokens SET created_at = now() - interval '10 minutes' WHERE user_id = ${id} AND purpose = 'INVITE' AND used_at IS NULL`;
+    const resent = await call(resendInvite, `/api/v1/users/${id}/invitation`, {
+      method: 'POST',
+      jar: sa,
+      params: { id },
+      headers: { 'idempotency-key': crypto.randomUUID() },
+    });
+    expect(resent.status).toBe(200);
     const secondToken = tokenFrom(lastMailTo(email).text);
     expect(secondToken).not.toBe(firstToken);
+    // The resend response carries the new link, identical to the emailed one.
+    expect(tokenFrom(resent.body.data.inviteLink as string)).toBe(secondToken);
     expect(
       (await call(lookupInvite, `/api/v1/auth/invitations/lookup?token=${firstToken}`)).status,
     ).toBe(400);
     expect(
       (await call(lookupInvite, `/api/v1/auth/invitations/lookup?token=${secondToken}`)).status,
+    ).toBe(200);
+  });
+
+  it('a revoked invitation stops working and a fresh one can be sent afterwards', async () => {
+    const sa = await signInAdmin('superadmin@jobbank.local');
+    const email = uniqueEmail('revoke');
+    const invited = await call(inviteRoute, '/api/v1/users', {
+      method: 'POST',
+      jar: sa,
+      headers: { 'idempotency-key': crypto.randomUUID() },
+      body: { name: 'Re Voke', email, role: 'STAFF', branchId: KHI },
+    });
+    const token = tokenFrom(lastMailTo(email).text);
+    const id = invited.body.data.user.id;
+    const revoked = await call(revokeInvite, `/api/v1/users/${id}/invitation/revoke`, {
+      method: 'POST',
+      jar: sa,
+      params: { id },
+    });
+    expect(revoked.status).toBe(200);
+    expect(revoked.body.data).toMatchObject({ revoked: true });
+    expect(
+      (await call(lookupInvite, `/api/v1/auth/invitations/lookup?token=${token}`)).status,
+    ).toBe(400);
+    expect(
+      (
+        await call(acceptInvite, '/api/v1/auth/invitations/accept', {
+          method: 'POST',
+          body: { token, password: 'Strong-pass-123' },
+        })
+      ).status,
+    ).toBe(400);
+    const resent = await call(resendInvite, `/api/v1/users/${id}/invitation`, {
+      method: 'POST',
+      jar: sa,
+      params: { id },
+      headers: { 'idempotency-key': crypto.randomUUID() },
+    });
+    expect(resent.status).toBe(200);
+    const freshToken = tokenFrom(lastMailTo(email).text);
+    expect(freshToken).not.toBe(token);
+    expect(
+      (await call(lookupInvite, `/api/v1/auth/invitations/lookup?token=${freshToken}`)).status,
     ).toBe(200);
   });
 
@@ -543,7 +721,7 @@ describe('managing staff accounts', () => {
     expect((await call(me, '/api/v1/auth/me', { jar: person.jar })).status).toBe(401);
     const blocked = await call(login, '/api/v1/auth/login', {
       method: 'POST',
-      body: { email: person.email, password: DEV_PASSWORD },
+      body: { email: person.email, password: getSeedDevPassword() },
     });
     expect(blocked.body.error.details).toEqual({ reason: 'ACCOUNT_DISABLED' });
 
@@ -557,7 +735,7 @@ describe('managing staff accounts', () => {
       (
         await call(login, '/api/v1/auth/login', {
           method: 'POST',
-          body: { email: person.email, password: DEV_PASSWORD },
+          body: { email: person.email, password: getSeedDevPassword() },
         })
       ).status,
     ).toBe(200);
@@ -589,24 +767,38 @@ describe('managing staff accounts', () => {
   it('resetting a lost authenticator signs them out and makes them enrol again', async () => {
     const sa = await signInAdmin('superadmin@jobbank.local');
     const person = await inviteAndActivate(sa, 'VERIFIER', LHR);
-    await enrollTwoFactor(person.email, person.jar);
+    // inviteAndActivate already enrolled the verifier (2FA is mandatory for
+    // them). Enrolling again here would fail: the setup token on the jar
+    // died once the first enrolment completed, and a setup token wins over
+    // the live session on the enrol route.
+    // Audit 2026-11-11 (M-28): the acting admin's password is required — a
+    // wrong password refuses the reset and leaves 2FA in place.
+    const wrongPassword = await call(reset2faRoute, '/x', {
+      method: 'POST',
+      jar: sa,
+      params: { id: person.id },
+      body: { reason: 'Lost phone', password: 'not-the-password' },
+    });
+    expect(wrongPassword.status).toBe(401);
     const reset2fa = await call(reset2faRoute, '/x', {
       method: 'POST',
       jar: sa,
       params: { id: person.id },
-      body: { reason: 'Lost phone' },
+      body: { reason: 'Lost phone', password: getSeedDevPassword() },
     });
     expect(reset2fa.body.data.twoFactorEnabled).toBe(false);
     expect((await call(me, '/api/v1/auth/me', { jar: person.jar })).status).toBe(401);
     const relogin = await call(login, '/api/v1/auth/login', {
       method: 'POST',
-      body: { email: person.email, password: DEV_PASSWORD },
+      body: { email: person.email, password: getSeedDevPassword() },
     });
-    expect(relogin.body.data.kind).toBe('signed_in');
+    // Verifiers are 2FA-required now: after the reset there is no
+    // authenticator left, so sign-in ends in enrolment, not a session.
+    expect(relogin.body.data.kind).toBe('two_factor_setup_required');
   });
 });
 
-// ─── Password reset & employer email codes ────────────────────────────
+// ─── Password reset ────────────────────────────────────────────────────
 
 describe('password reset', () => {
   it('emails a single-use link, changes the password and signs out other sessions', async () => {
@@ -633,7 +825,7 @@ describe('password reset', () => {
       (
         await call(login, '/x', {
           method: 'POST',
-          body: { email: person.email, password: DEV_PASSWORD },
+          body: { email: person.email, password: getSeedDevPassword() },
         })
       ).status,
     ).toBe(401);
@@ -650,47 +842,203 @@ describe('password reset', () => {
         .status,
     ).toBe(400);
   });
-});
 
-describe('employer email sign-in codes', () => {
-  it('signs an employer in with an emailed code, and never sends codes to non-employers', async () => {
+  it('works for an employer, and the authenticator still stands after the reset', async () => {
     const email = 'employer@jobbank.local';
-    await resetTwoFactor(email);
-    const req = await call(emailCodeRequest, '/x', { method: 'POST', body: { email } });
-    expect(req.status).toBe(202);
-    const code = lastMailTo(email).subject.match(/^(\d{6})/)?.[1];
-    expect(code).toMatch(/^\d{6}$/);
+    const jar = await signInWith2fa(email);
+    expect((await call(me, '/api/v1/auth/me', { jar })).status).toBe(200);
 
+    expect((await call(forgot, '/x', { method: 'POST', body: { email } })).status).toBe(202);
+    const token = tokenFrom(lastMailTo(email).text);
+    expect(token.length).toBeGreaterThan(20);
+
+    const done = await call(reset, '/x', {
+      method: 'POST',
+      body: { token, password: 'Employer-new-99' },
+    });
+    expect(done.status).toBe(200);
+
+    // The reset signs the employer out everywhere, and the old password is dead.
+    expect((await call(me, '/api/v1/auth/me', { jar })).status).toBe(401);
     expect(
       (
-        await call(emailCodeVerify, '/x', {
+        await call(login, '/x', {
           method: 'POST',
-          body: { email, code: code === '000000' ? '111111' : '000000' },
+          body: { email, password: getSeedDevPassword() },
         })
       ).status,
     ).toBe(401);
-    const jar = new Jar();
-    const ok = await call(emailCodeVerify, '/x', { method: 'POST', jar, body: { email, code } });
+
+    // The new password works — but only with the authenticator code: the
+    // reset changes the password, it does not clear the enrolment.
+    const step1 = new Jar();
+    const pw = await call(login, '/x', {
+      method: 'POST',
+      body: { email, password: 'Employer-new-99' },
+      jar: step1,
+    });
+    expect(pw.body.data).toMatchObject({ kind: 'two_factor_required', methods: ['totp'] });
+    expect((await call(me, '/api/v1/auth/me', { jar: step1 })).status).toBe(401);
+    const ok = await call(verify2fa, '/api/v1/auth/2fa/verify', {
+      method: 'POST',
+      jar: step1,
+      body: { code: totpCode(email) },
+    });
     expect(ok.status).toBe(200);
-    expect(ok.body.data).toMatchObject({ kind: 'signed_in', homePath: '/employer' });
+    expect((await call(me, '/api/v1/auth/me', { jar: step1 })).status).toBe(200);
 
-    const before = mailOutbox.length;
+    // The link is single-use.
     expect(
-      (
-        await call(emailCodeRequest, '/x', {
-          method: 'POST',
-          body: { email: 'staff.khi@jobbank.local' },
-        })
-      ).status,
-    ).toBe(202);
-    expect(mailOutbox.length).toBe(before);
+      (await call(reset, '/x', { method: 'POST', body: { token, password: 'Another-pass-99' } }))
+        .status,
+    ).toBe(400);
 
-    const [auditRow] = await db
-      .select()
-      .from(schema.auditLogs)
-      .where(eq(schema.auditLogs.action, 'auth.email_code_requested'))
-      .orderBy(desc(schema.auditLogs.id))
-      .limit(1);
-    expect(auditRow?.metadata).toMatchObject({ sent: false });
+    // This file shares the seeded employer. Put the password back so later
+    // tests (and other files) can still sign in with SEED_DEV_PASSWORD.
+    const [employerUser] = await db
+      .select({ id: schema.users.id })
+      .from(schema.users)
+      .where(eq(schema.users.email, email));
+    await db
+      .update(schema.accounts)
+      .set({ password: await hashPassword(getSeedDevPassword()) })
+      .where(eq(schema.accounts.userId, employerUser!.id));
+  });
+});
+
+describe('two-factor for Staff and Employer (extended 2026-11-15)', () => {
+  it('Staff is blocked until enrolment, then needs a code at every sign-in, and cannot turn it off', async () => {
+    const email = 'staff.khi@jobbank.local';
+    await resetTwoFactor(email);
+    // H-02: a never-enrolled 2FA-required staff member gets no session at
+    // login — only a short-lived setup token.
+    const jar = await signIn(email);
+    expect(jar.setupToken?.startsWith('v1.')).toBe(true);
+    expect((await call(me, '/api/v1/auth/me', { jar })).status).toBe(401);
+
+    await enrollTwoFactor(email, jar);
+    expect((await call(me, '/api/v1/auth/me', { jar })).body.data.twoFactorPending).toBe(false);
+
+    // Next sign-in: password alone is not enough. Trust-this-device is offered;
+    // leaving it unchecked still asks for a code next time.
+    const step1 = new Jar();
+    const pw = await call(login, '/x', {
+      method: 'POST',
+      body: { email, password: getSeedDevPassword() },
+      jar: step1,
+    });
+    expect(pw.body.data).toMatchObject({
+      kind: 'two_factor_required',
+      methods: ['totp'],
+      trustDeviceAllowed: true,
+    });
+    expect((await call(me, '/api/v1/auth/me', { jar: step1 })).status).toBe(401);
+    const ok = await call(verify2fa, '/api/v1/auth/2fa/verify', {
+      method: 'POST',
+      jar: step1,
+      body: { code: totpCode(email) },
+    });
+    expect(ok.status).toBe(200);
+
+    const refused = await call(disable2fa, '/api/v1/account/2fa/disable', {
+      method: 'POST',
+      jar: step1,
+      body: { password: getSeedDevPassword() },
+    });
+    expect(refused.status).toBe(403);
+  });
+
+  it('trusts this browser for 30 days when the 2FA step checks trust this device', async () => {
+    const email = 'staff.khi@jobbank.local';
+    await resetTwoFactor(email);
+    const enrolled = await signIn(email);
+    await enrollTwoFactor(email, enrolled);
+
+    const jar = new Jar();
+    const challenge = await call(login, '/x', {
+      method: 'POST',
+      body: { email, password: getSeedDevPassword() },
+      jar,
+    });
+    expect(challenge.body.data).toMatchObject({
+      kind: 'two_factor_required',
+      trustDeviceAllowed: true,
+    });
+    const verified = await call(verify2fa, '/api/v1/auth/2fa/verify', {
+      method: 'POST',
+      jar,
+      body: { code: totpCode(email), trustDevice: true },
+    });
+    expect(verified.status, JSON.stringify(verified.body)).toBe(200);
+
+    const [user] = await db
+      .select({ id: schema.users.id })
+      .from(schema.users)
+      .where(eq(schema.users.email, email));
+    const trusted = await db
+      .select({ identifier: schema.verifications.identifier })
+      .from(schema.verifications)
+      .where(
+        and(
+          eq(schema.verifications.value, user!.id),
+          like(schema.verifications.identifier, 'trust-device-%'),
+        ),
+      );
+    expect(trusted.length).toBeGreaterThan(0);
+
+    // Same browser (the jar still holds the trust cookie): password alone.
+    const again = await call(login, '/x', {
+      method: 'POST',
+      body: { email, password: getSeedDevPassword() },
+      jar,
+    });
+    expect(again.status, JSON.stringify(again.body)).toBe(200);
+    expect(again.body.data.kind).toBe('signed_in');
+
+    // A browser without the cookie is still challenged.
+    const fresh = new Jar();
+    const untrusted = await call(login, '/x', {
+      method: 'POST',
+      body: { email, password: getSeedDevPassword() },
+      jar: fresh,
+    });
+    expect(untrusted.body.data.kind).toBe('two_factor_required');
+  });
+
+  it('Employer is blocked until enrolment and cannot turn two-factor off', async () => {
+    const email = 'employer@jobbank.local';
+    await resetTwoFactor(email);
+    const jar = await signIn(email);
+    expect(jar.setupToken?.startsWith('v1.')).toBe(true);
+    expect((await call(me, '/api/v1/auth/me', { jar })).status).toBe(401);
+
+    await enrollTwoFactor(email, jar);
+    expect((await call(me, '/api/v1/auth/me', { jar })).body.data.twoFactorPending).toBe(false);
+
+    const refused = await call(disable2fa, '/api/v1/account/2fa/disable', {
+      method: 'POST',
+      jar,
+      body: { password: getSeedDevPassword() },
+    });
+    expect(refused.status).toBe(403);
+  });
+
+  it('Employer signup ends in authenticator enrolment, not a signed-in session', async () => {
+    // signUpEmployer signs the new account in through the normal path, so a
+    // brand-new employer — who has no authenticator yet — gets the setup
+    // token instead of a session. (Before the employer 2FA change this threw
+    // "A new employer account cannot have 2FA".)
+    const email = uniqueEmail('employer2fa');
+    const codeRes = await call(signupCode, '/x', { method: 'POST', body: { email } });
+    expect(codeRes.status).toBe(202);
+    const code = lastMailTo(email).subject.match(/^(\d{6})/)?.[1];
+    expect(code).toMatch(/^\d{6}$/);
+    const done = await call(signupComplete, '/x', {
+      method: 'POST',
+      body: { email, code, fullName: 'Two Factor Owner', password: getSeedDevPassword() },
+    });
+    expect(done.status).toBe(200);
+    expect(done.body.data.kind).toBe('two_factor_setup_required');
+    expect(done.body.data.setupToken?.startsWith('v1.')).toBe(true);
   });
 });

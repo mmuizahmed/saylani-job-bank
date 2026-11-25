@@ -6,7 +6,10 @@ import { useRouter } from 'next/navigation';
 import type { ReactNode } from 'react';
 import { toast } from '@/components/molecules';
 import { DashboardLayout } from '@/components/templates';
-import { ApiClientError, apiFetch } from '@/lib/api/client';
+import { apiFetch, friendlyApiError } from '@/lib/api/client';
+import type { SelectOption } from '@/components/atoms';
+import { IssueApplicantTokenDialog } from './applicants/IssueApplicantTokenDialog';
+import { RegisterCompanyDialog } from './companies/RegisterCompanyDialog';
 import { navigationFor } from './navigation';
 import { useSignOut } from './SignOutButton';
 
@@ -19,9 +22,15 @@ export interface RoleShellProps {
   branchNames: string[];
   /** Super Admin only: every branch, for the scope switcher. */
   switchableBranches?: { id: string; name: string }[];
+  /** Branches this staff member may register applicants for. */
+  registrationBranches?: SelectOption[];
+  /** Active branches this role may register companies for. */
+  companyRegistrationBranches?: SelectOption[];
   activeBranchId?: string | null;
   /** Applicants have no password/2FA settings. */
   showSecurity?: boolean;
+  /** Employer with no own job postings: hide the Jobs nav item. */
+  hideEmployerJobs?: boolean;
   children: ReactNode;
 }
 
@@ -30,8 +39,11 @@ export function RoleShell({
   user,
   branchNames,
   switchableBranches,
+  registrationBranches,
+  companyRegistrationBranches,
   activeBranchId,
   showSecurity = true,
+  hideEmployerJobs = false,
   children,
 }: RoleShellProps) {
   const router = useRouter();
@@ -45,13 +57,29 @@ export function RoleShell({
       });
       router.refresh();
     } catch (err) {
-      toast.error(err instanceof ApiClientError ? err.message : 'Could not switch branch');
+      toast.error(friendlyApiError(err));
     }
   };
 
   return (
     <DashboardLayout
-      navigation={navigationFor(role)}
+      navigation={navigationFor(role, { hideEmployerJobs })}
+      sidebarAction={
+        registrationBranches || companyRegistrationBranches ? (
+          <div className="grid gap-2">
+            {registrationBranches && (
+              // Token-only first counter (2026-11-07 reversal): the sidebar
+              // issues a numbered token from a CNIC + name. The lookup and
+              // full-registration buttons were removed 2026-11-09 (user did
+              // not ask for them); the dialogs still exist in code, unused.
+              <IssueApplicantTokenDialog branches={registrationBranches} placement="sidebar" />
+            )}
+            {companyRegistrationBranches && (
+              <RegisterCompanyDialog branches={companyRegistrationBranches} placement="sidebar" />
+            )}
+          </div>
+        ) : undefined
+      }
       sidebarFooter={
         <div
           className="mx-1 rounded-xl p-3"

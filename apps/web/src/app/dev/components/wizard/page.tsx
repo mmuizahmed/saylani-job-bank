@@ -2,8 +2,13 @@
 
 import { useState } from 'react';
 import { Input, Select } from '@/components/atoms';
-import { CNICInput, FileUploader, FormField, toast } from '@/components/molecules';
-import { MapPinPicker, type LatLng } from '@/components/organisms';
+import {
+  CNICInput,
+  FileUploader,
+  FormField,
+  GeocodeAddressPicker,
+  toast,
+} from '@/components/molecules';
 import { WizardLayout } from '@/components/templates';
 import { fakeUpload } from '../_demo/data';
 
@@ -25,7 +30,7 @@ const steps = [
 export default function WizardDemoPage() {
   const [current, setCurrent] = useState(0);
   const [saving, setSaving] = useState(false);
-  const [pin, setPin] = useState<LatLng | null>(null);
+  const [pin, setPin] = useState<{ lat: number; lng: number } | null>(null);
 
   const next = () => {
     setSaving(true);
@@ -69,7 +74,7 @@ export default function WizardDemoPage() {
             </FormField>
           </div>
         )}
-        {current === 1 && <MapPinPicker value={pin} onChange={setPin} label="Your home location" />}
+        {current === 1 && <GeocodeAddressPicker value={pin} onChange={setPin} />}
         {current === 2 && (
           <FormField label="Main trade" required>
             <Select

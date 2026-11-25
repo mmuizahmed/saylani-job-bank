@@ -2,77 +2,47 @@ import {
   Activity,
   ArrowDownRight,
   ArrowUpRight,
+  Bell,
   Briefcase,
   Building2,
   Calendar,
   CheckCircle2,
-  ChevronRight,
   Clock,
-  Download,
   FileText,
   GitBranch,
   MapPin,
   Settings,
   ShieldCheck,
   Star,
-  Target,
   UserRound,
   Users,
-  Zap,
 } from 'lucide-react';
 import { InteractiveBarChart, CardActionMenu } from './InteractiveBarChart';
+import { DashboardAutoRefresh } from './DashboardAutoRefresh';
 import type { LucideIcon } from 'lucide-react';
 import NextLink from 'next/link';
 import { ROLE_LABELS, type Role } from '@jobbank/shared';
 import { describeMe, requireRole } from '@/domains/auth';
 import { listBranches } from '@/domains/branch';
-import { listApplicants, getMyProfile } from '@/domains/applicant';
-import { listCompanies, listQueue } from '@/domains/company';
+import { listApplicants, getMyProfile, monthlyApplicantCounts } from '@/domains/applicant';
+import { countCompaniesOnboardedByMonth, listCompanies } from '@/domains/company';
+import { countEmployerCandidates, countHiresByMonth, listJobsForEmployer } from '@/domains/job';
+import { listMyNotifications } from '@/domains/notifications';
+import {
+  countInterviewerReferrals,
+  interviewPipelineCounts,
+  listInterviews,
+  listMyApplications,
+  monthlyInterviewCounts,
+} from '@/domains/placement';
 import { listStaff } from '@/domains/user';
-import { listMyJobs } from '@/domains/job';
-import { formatPkMobileDisplay } from '@/lib/format/phone';
+import { bucketByMonth, pktYearMonth } from './monthlySeries';
+import { formatDate } from '@/lib/format/date';
 
-/* ─── Monthly chart labels ──────────────────────────────────────── */
-const MONTHS_SHORT = [
-  'Jan',
-  'Feb',
-  'Mar',
-  'Apr',
-  'May',
-  'Jun',
-  'Jul',
-  'Aug',
-  'Sep',
-  'Oct',
-  'Nov',
-  'Dec',
-];
-
-/* ─── Chart shape (illustrative — real time-series coming later) ── */
-const ROLE_CHART: Record<Role, { values: number[]; peak: number; label: string }> = {
-  SUPER_ADMIN: {
-    values: [12, 18, 15, 22, 19, 26, 23, 31, 28, 0, 0, 0],
-    peak: 31,
-    label: 'Monthly Registrations',
-  },
-  BRANCH_ADMIN: {
-    values: [5, 8, 6, 10, 9, 13, 11, 16, 14, 0, 0, 0],
-    peak: 16,
-    label: 'Branch Registrations',
-  },
-  VERIFIER: {
-    values: [20, 28, 24, 35, 30, 42, 38, 48, 44, 0, 0, 0],
-    peak: 48,
-    label: 'Verifications Done',
-  },
-  STAFF: { values: [8, 12, 10, 16, 14, 20, 18, 24, 22, 0, 0, 0], peak: 24, label: 'Cases Handled' },
-  EMPLOYER: { values: [0, 1, 1, 2, 1, 3, 2, 4, 3, 0, 0, 0], peak: 4, label: 'Hires Made' },
-  APPLICANT: {
-    values: [10, 20, 35, 50, 60, 68, 75, 82, 88, 0, 0, 0],
-    peak: 88,
-    label: 'Profile Strength %',
-  },
-};
+/* ─── Monthly chart values are computed per role below, from live DB ────
+   counts (monthlyApplicantCounts, countCompaniesOnboardedByMonth,
+   countHiresByMonth, or the applicant's own applications). No hardcoded
+   series lives here any more. ─────────────────────────────────────────── */
 
 /* ─── Action buttons per role (static) ─────────────────────────── */
 const ROLE_ACTIONS: Record<
@@ -80,27 +50,36 @@ const ROLE_ACTIONS: Record<
   {
     action1: { label: string; href: string };
     action2: { label: string; href: string };
+    /** Optional third shortcut — only roles that need one define it. */
+    action3?: { label: string; href: string };
   }
 > = {
   SUPER_ADMIN: {
     action1: { label: 'Browse Applicants', href: '/super-admin/applicants' },
     action2: { label: 'Manage Staff', href: '/super-admin/staff' },
+    // The dashboard had no way to reach the add-branch page: the only
+    // entry point was sidebar Branches → list → New branch.
+    action3: { label: 'Add Branch', href: '/super-admin/branches/new' },
   },
   BRANCH_ADMIN: {
     action1: { label: 'View Applicants', href: '/branch-admin/applicants' },
     action2: { label: 'Add Staff', href: '/branch-admin/staff' },
   },
   VERIFIER: {
-    action1: { label: 'Open Queue', href: '/verifier/queue' },
-    action2: { label: 'My Cases', href: '/verifier/queue?filter=mine' },
+    action1: { label: 'View Companies', href: '/verifier/companies' },
+    action2: { label: 'View Jobs', href: '/verifier/jobs' },
   },
   STAFF: {
     action1: { label: 'View Applicants', href: '/staff/applicants' },
     action2: { label: 'Open Jobs', href: '/staff/jobs' },
   },
+  INTERVIEWER_SCHEDULER: {
+    action1: { label: 'View Interviews', href: '/interviewer-scheduler/interviews' },
+    action2: { label: 'View Applicants', href: '/interviewer-scheduler/applicants' },
+  },
   EMPLOYER: {
     action1: { label: 'Post a Job', href: '/employer/jobs/new' },
-    action2: { label: 'View Candidates', href: '/employer/candidates' },
+    action2: { label: 'View My Jobs', href: '/employer/jobs' },
   },
   APPLICANT: {
     action1: { label: 'Edit Profile', href: '/applicant/profile' },
@@ -108,271 +87,74 @@ const ROLE_ACTIONS: Record<
   },
 };
 
-/* ─── Recent activity (illustrative until audit log is built) ───── */
-const ROLE_ACTIVITY: Record<
-  Role,
-  {
-    icon: LucideIcon;
-    action: string;
-    detail: string;
-    when: string;
-    price: string;
-    status: 'success' | 'pending' | 'info' | 'warning';
-  }[]
-> = {
-  SUPER_ADMIN: [
-    {
-      icon: Building2,
-      action: 'Company Verified',
-      detail: 'TechCorp Pvt Ltd',
-      when: 'Today, 10:42 AM',
-      price: 'Karachi',
-      status: 'success',
-    },
-    {
-      icon: GitBranch,
-      action: 'Branch Added',
-      detail: 'Faisalabad North',
-      when: 'Today, 9:15 AM',
-      price: '3 staff',
-      status: 'success',
-    },
-    {
-      icon: Users,
-      action: 'Staff Joined',
-      detail: 'Ayesha Khan',
-      when: 'Yesterday, 4:30 PM',
-      price: 'Lahore',
-      status: 'info',
-    },
-    {
-      icon: ShieldCheck,
-      action: 'Verification Issue',
-      detail: 'CNIC dispute',
-      when: 'Yesterday, 2:00 PM',
-      price: 'Rawalpindi',
-      status: 'warning',
-    },
-    {
-      icon: Activity,
-      action: 'Placement Recorded',
-      detail: 'Ahmed Ali',
-      when: '2 days ago',
-      price: 'Multan',
-      status: 'success',
-    },
-  ],
-  BRANCH_ADMIN: [
-    {
-      icon: Users,
-      action: 'New Applicant',
-      detail: 'Fatima Bibi',
-      when: 'Today, 11:05 AM',
-      price: 'House Helper',
-      status: 'success',
-    },
-    {
-      icon: Building2,
-      action: 'Employer Inquiry',
-      detail: 'Royal Home Services',
-      when: 'Today, 9:48 AM',
-      price: 'Pending',
-      status: 'pending',
-    },
-    {
-      icon: ShieldCheck,
-      action: 'ID Verified',
-      detail: 'Zubair Ahmed',
-      when: 'Yesterday, 3:20 PM',
-      price: 'CNIC Check',
-      status: 'success',
-    },
-    {
-      icon: Briefcase,
-      action: 'Job Posted',
-      detail: 'Cook — DHA Phase 5',
-      when: 'Yesterday, 1:00 PM',
-      price: 'Lahore',
-      status: 'info',
-    },
-    {
-      icon: Activity,
-      action: 'Placement Confirmed',
-      detail: 'Nasreen Bano',
-      when: '2 days ago',
-      price: 'Driver Helper',
-      status: 'success',
-    },
-  ],
-  VERIFIER: [
-    {
-      icon: CheckCircle2,
-      action: 'Identity Verified',
-      detail: 'CNIC — Case #1045',
-      when: 'Today, 11:30 AM',
-      price: 'Pass',
-      status: 'success',
-    },
-    {
-      icon: Clock,
-      action: 'Case Claimed',
-      detail: 'Case #1042',
-      when: 'Today, 10:00 AM',
-      price: 'In Review',
-      status: 'pending',
-    },
-    {
-      icon: ShieldCheck,
-      action: 'Doc Reviewed',
-      detail: 'Matric Certificate',
-      when: 'Yesterday, 5:00 PM',
-      price: 'Valid',
-      status: 'success',
-    },
-    {
-      icon: Zap,
-      action: 'SLA Reminder',
-      detail: 'Case #1038',
-      when: 'Yesterday, 3:45 PM',
-      price: 'Due 2h',
-      status: 'warning',
-    },
-    {
-      icon: CheckCircle2,
-      action: 'Batch Completed',
-      detail: '6 identities done',
-      when: '2 days ago',
-      price: '6 cases',
-      status: 'success',
-    },
-  ],
-  STAFF: [
-    {
-      icon: Users,
-      action: 'Applicant Profiled',
-      detail: 'Rashid Mehmood',
-      when: 'Today, 10:20 AM',
-      price: '5 skills',
-      status: 'success',
-    },
-    {
-      icon: Target,
-      action: 'Match Suggested',
-      detail: 'Zara Bibi → Cook',
-      when: 'Today, 9:30 AM',
-      price: 'Pending',
-      status: 'info',
-    },
-    {
-      icon: Calendar,
-      action: 'Interview Scheduled',
-      detail: 'Ali Hassan',
-      when: 'Yesterday',
-      price: 'Tomorrow 2 PM',
-      status: 'pending',
-    },
-    {
-      icon: Activity,
-      action: 'Placement Recorded',
-      detail: 'Mariam Naz',
-      when: 'Yesterday',
-      price: 'Office Cleaner',
-      status: 'success',
-    },
-    {
-      icon: Briefcase,
-      action: 'New Job Received',
-      detail: 'Driver — Islamabad',
-      when: '2 days ago',
-      price: 'Open',
-      status: 'info',
-    },
-  ],
-  EMPLOYER: [
-    {
-      icon: Users,
-      action: 'Candidate Referred',
-      detail: 'Imran Malik — Cook',
-      when: 'Today, 10:00 AM',
-      price: 'Pending',
-      status: 'pending',
-    },
-    {
-      icon: Calendar,
-      action: 'Interview Scheduled',
-      detail: 'Saima Bibi',
-      when: 'Yesterday',
-      price: 'Thu 11 AM',
-      status: 'success',
-    },
-    {
-      icon: Briefcase,
-      action: 'Job Posted',
-      detail: 'Guard — DHA Karachi',
-      when: '2 days ago',
-      price: 'Open',
-      status: 'success',
-    },
-    {
-      icon: CheckCircle2,
-      action: 'Hire Confirmed',
-      detail: 'Nadeem Khan',
-      when: '3 days ago',
-      price: 'Placed',
-      status: 'success',
-    },
-    {
-      icon: Building2,
-      action: 'Profile Updated',
-      detail: 'License renewed',
-      when: '4 days ago',
-      price: 'Done',
-      status: 'info',
-    },
-  ],
-  APPLICANT: [
-    {
-      icon: UserRound,
-      action: 'Profile Updated',
-      detail: 'Skills section done',
-      when: 'Today',
-      price: '+5 skills',
-      status: 'success',
-    },
-    {
-      icon: FileText,
-      action: 'Document Uploaded',
-      detail: 'CNIC front & back',
-      when: 'Yesterday',
-      price: '2 files',
-      status: 'success',
-    },
-    {
-      icon: MapPin,
-      action: 'Location Added',
-      detail: 'Gulshan-e-Iqbal',
-      when: '2 days ago',
-      price: 'Karachi',
-      status: 'info',
-    },
-    {
-      icon: ShieldCheck,
-      action: 'Identity Check',
-      detail: 'Verification sent',
-      when: '3 days ago',
-      price: 'In Review',
-      status: 'pending',
-    },
-    {
-      icon: Activity,
-      action: 'Profile Activated',
-      detail: 'Now visible to staff',
-      when: '4 days ago',
-      price: 'Live',
-      status: 'success',
-    },
-  ],
+/* ─── Relative date helper ──────────────────────────────────────── */
+function relativeDate(iso: string | Date): string {
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const diffH = Math.floor(diffMs / (1000 * 60 * 60));
+  if (diffH < 1) return 'Just now';
+  if (diffH < 24) return `${diffH}h ago`;
+  const diffD = Math.floor(diffH / 24);
+  if (diffD === 1) return 'Yesterday';
+  if (diffD < 7) return `${diffD} days ago`;
+  return formatDate(iso);
+}
+
+/* ─── Activity item type ────────────────────────────────────────── */
+type ActivityItem = {
+  icon: LucideIcon;
+  action: string;
+  detail: string;
+  when: string;
+  price: string;
+  status: 'success' | 'pending' | 'info' | 'warning';
 };
+
+/* ─── Recent activity: built from real rows, never invented ──────────── */
+const APPLICANT_ACTIVITY_STATUS: Record<string, ActivityItem['status']> = {
+  ACTIVE: 'success',
+  INACTIVE: 'info',
+};
+
+function toApplicantActivity(a: {
+  fullName: string;
+  status: string;
+  cityLabel: string | null;
+  branchName: string | null;
+  createdAt: string;
+}): ActivityItem {
+  return {
+    icon: Users,
+    action: 'Applicant Registered',
+    detail: a.fullName,
+    when: relativeDate(a.createdAt),
+    price: a.cityLabel ?? a.branchName ?? '—',
+    status: APPLICANT_ACTIVITY_STATUS[a.status] ?? 'info',
+  };
+}
+
+function toCompanyActivity(c: {
+  legalName: string;
+  branchName: string | null;
+  createdAt: string;
+  verifiedAt: string | null;
+}): ActivityItem {
+  return {
+    icon: Building2,
+    action: 'Company Verified',
+    detail: c.legalName,
+    when: relativeDate(c.verifiedAt ?? c.createdAt),
+    price: c.branchName ?? 'Verified',
+    status: 'success',
+  };
+}
+
+/** Newest-first merge of timestamped activity items, capped at 5. */
+function latestActivity(entries: { at: string; item: ActivityItem }[]): ActivityItem[] {
+  return entries
+    .sort((x, y) => y.at.localeCompare(x.at))
+    .slice(0, 5)
+    .map((e) => e.item);
+}
 
 const STATUS_PILL: Record<
   'success' | 'pending' | 'info' | 'warning',
@@ -422,6 +204,20 @@ function fmt(n: number) {
   return n.toLocaleString('en-PK');
 }
 
+/**
+ * Application statuses with no further action possible. "Active
+ * Applications" counts everything except these — rejected, refused, hired
+ * and staff-rejected applications are outcomes, not live applications.
+ */
+const TERMINAL_APPLICATION_STATUSES: readonly string[] = [
+  'EMPLOYER_REJECTED',
+  'APPLICANT_REFUSED',
+  'HIRED',
+  'REJECTED',
+  // 0052 — a failed interview is an outcome, not a live application.
+  'INTERVIEW_FAILED',
+];
+
 /* ─── Component ─────────────────────────────────────────────────── */
 export async function WelcomePanel({ role }: { role: Role }) {
   const { user, actor } = await requireRole(role);
@@ -432,11 +228,25 @@ export async function WelcomePanel({ role }: { role: Role }) {
   let main: DashMain;
   let smallStats: DashSmallStat[];
   let pipeline: DashPipeline;
+  /* Chart + activity are real per-role data too (see each branch below);
+     they start empty and every branch fills them in. */
+  /* Year and "current month" are derived once, here, in PKT — the chart
+     and the month counts all use this one clock (L1). */
+  const { year, monthIndex: currentMonth } = pktYearMonth();
+  let chartValues: number[] = Array.from({ length: 12 }, () => 0);
+  let chartLabel = '';
+  let activity: ActivityItem[] = [];
+  let jobs: {
+    title: string;
+    status: string;
+    vacancies: number | null;
+    createdAt: string;
+  }[] = [];
 
   if (role === 'SUPER_ADMIN') {
     const [r_all, r_active, r_co_all, r_co_ver, r_staff] = await Promise.all([
       listApplicants(actor, minQ('createdAt')),
-      listApplicants(actor, minQ('createdAt', { status: 'ACTIVE' })),
+      listApplicants(actor, minQ('createdAt', { status: ['ACTIVE'] })),
       listCompanies(actor, minQ('createdAt')),
       listCompanies(actor, minQ('createdAt', { status: 'VERIFIED' })),
       listStaff(actor, minQ('createdAt')),
@@ -444,7 +254,9 @@ export async function WelcomePanel({ role }: { role: Role }) {
     const totalUsers = r_all.meta.total + r_staff.meta.total;
     main = {
       icon: Users,
-      label: 'Total Platform Users',
+      // Was "Total Platform Users": the total only ever counted applicants
+      // + staff (employer/verifier/BA accounts excluded), so label it so.
+      label: 'Applicants + Staff',
       value: fmt(totalUsers),
       trend: {
         dir: 'up',
@@ -455,7 +267,9 @@ export async function WelcomePanel({ role }: { role: Role }) {
         { icon: Users, label: 'Applicants', value: fmt(r_all.meta.total), status: 'active' },
         {
           icon: Building2,
-          label: 'Employers',
+          // Was "Employers": this is the verified-company count, not a
+          // count of employer user accounts.
+          label: 'Verified Companies',
           value: fmt(r_co_ver.pagination.total),
           status: 'active',
         },
@@ -499,18 +313,39 @@ export async function WelcomePanel({ role }: { role: Role }) {
         {
           icon: GitBranch,
           label: 'Branches Active',
-          current: visible.length,
+          // Was current == total (always 100%): active branches over ALL
+          // visible branches, including inactive ones.
+          current: visible.filter((b) => b.isActive).length,
           total: Math.max(visible.length, 1),
           color: '#b45309',
         },
       ],
     };
+    const [recentApplicants, recentCompanies] = await Promise.all([
+      listApplicants(actor, { ...minQ('createdAt'), pageSize: 5, limit: 5 }),
+      // M3: the 5 most recently VERIFIED companies — ordered by verifiedAt,
+      // not by creation date (a company verified today must show up).
+      listCompanies(actor, {
+        ...minQ('verifiedAt'),
+        pageSize: 5,
+        limit: 5,
+        filters: { status: 'VERIFIED' },
+      }),
+    ]);
+    activity = latestActivity([
+      ...recentApplicants.data.map((a) => ({ at: a.createdAt, item: toApplicantActivity(a) })),
+      ...recentCompanies.items.map((c) => ({
+        at: c.verifiedAt ?? c.createdAt,
+        item: toCompanyActivity(c),
+      })),
+    ]);
+    chartValues = await monthlyApplicantCounts(actor, year);
+    chartLabel = 'Monthly Registrations';
   } else if (role === 'BRANCH_ADMIN') {
-    const [r_all, r_active, r_draft, r_id_ver] = await Promise.all([
+    const [r_all, r_active, r_id_ver] = await Promise.all([
       listApplicants(actor, minQ('createdAt')),
-      listApplicants(actor, minQ('createdAt', { status: 'ACTIVE' })),
-      listApplicants(actor, minQ('createdAt', { status: 'DRAFT' })),
-      listApplicants(actor, minQ('createdAt', { identityStatus: 'VERIFIED' })),
+      listApplicants(actor, minQ('createdAt', { status: ['ACTIVE'] })),
+      listApplicants(actor, minQ('createdAt', { identityStatus: ['VERIFIED'] })),
     ]);
     main = {
       icon: Users,
@@ -520,7 +355,6 @@ export async function WelcomePanel({ role }: { role: Role }) {
       subTitle: 'By Status',
       subItems: [
         { icon: CheckCircle2, label: 'Active', value: fmt(r_active.meta.total), status: 'active' },
-        { icon: Clock, label: 'Draft', value: fmt(r_draft.meta.total), status: 'active' },
         {
           icon: ShieldCheck,
           label: 'ID Verified',
@@ -576,89 +410,105 @@ export async function WelcomePanel({ role }: { role: Role }) {
         },
       ],
     };
+    const [recentApplicants, recentCompanies] = await Promise.all([
+      listApplicants(actor, { ...minQ('createdAt'), pageSize: 5, limit: 5 }),
+      // M3: the 5 most recently VERIFIED companies — ordered by verifiedAt,
+      // not by creation date (a company verified today must show up).
+      listCompanies(actor, {
+        ...minQ('verifiedAt'),
+        pageSize: 5,
+        limit: 5,
+        filters: { status: 'VERIFIED' },
+      }),
+    ]);
+    activity = latestActivity([
+      ...recentApplicants.data.map((a) => ({ at: a.createdAt, item: toApplicantActivity(a) })),
+      ...recentCompanies.items.map((c) => ({
+        at: c.verifiedAt ?? c.createdAt,
+        item: toCompanyActivity(c),
+      })),
+    ]);
+    chartValues = await monthlyApplicantCounts(actor, year);
+    chartLabel = 'Branch Registrations';
   } else if (role === 'VERIFIER') {
-    const { items: qItems } = await listQueue(actor, {
-      page: 1,
-      pageSize: 100,
-      limit: 100,
-      offset: 0,
-      sort: { field: 'slaDueOn', direction: 'asc' },
-      q: undefined,
-      filters: {},
-    });
-    const unclaimed = qItems.filter((i) => !i.verifierId).length;
-    const inReview = qItems.filter((i) => !!i.verifierId).length;
-    const breached = qItems.filter((i) => i.sla === 'BREACHED').length;
-    const dueToday = qItems.filter((i) => i.sla === 'DUE_TODAY').length;
+    // 2026-11-14: verification moved to the Branch Admin, so the verifier
+    // dashboard no longer shows the queue (listQueue needs company:verify).
+    // It shows registration work instead: companies in their branch by
+    // status, and their own monthly field-visit registrations.
+    const [r_all, r_draft, r_verified, recentCompanies] = await Promise.all([
+      listCompanies(actor, minQ('createdAt')),
+      listCompanies(actor, minQ('createdAt', { status: 'DRAFT' })),
+      listCompanies(actor, minQ('createdAt', { status: 'VERIFIED' })),
+      listCompanies(actor, { ...minQ('createdAt'), pageSize: 5, limit: 5 }),
+    ]);
+    const total = r_all.pagination.total;
+    const draft = r_draft.pagination.total;
+    const verified = r_verified.pagination.total;
     main = {
-      icon: ShieldCheck,
-      label: 'Queue Status',
-      value: String(qItems.length),
+      icon: Building2,
+      label: 'Companies Registered',
+      value: fmt(total),
       trend: {
-        dir: breached > 0 ? 'down' : 'up',
-        text: breached > 0 ? `${breached} SLA breached` : 'All SLAs healthy',
+        dir: draft > 0 ? 'down' : 'up',
+        text: draft > 0 ? `${draft} awaiting Branch Admin review` : 'All reviewed',
       },
-      subTitle: 'Queue Breakdown',
+      subTitle: 'Registration Breakdown',
       subItems: [
-        { icon: Clock, label: 'Unclaimed', value: String(unclaimed), status: 'active' },
-        { icon: Zap, label: 'In Review', value: String(inReview), status: 'active' },
-        { icon: Calendar, label: 'Due Today', value: String(dueToday), status: 'active' },
-        {
-          icon: ShieldCheck,
-          label: 'SLA Breached',
-          value: String(breached),
-          status: breached > 0 ? 'inactive' : 'active',
-        },
+        { icon: Clock, label: 'Draft — awaiting review', value: fmt(draft), status: 'active' },
+        { icon: CheckCircle2, label: 'Verified', value: fmt(verified), status: 'active' },
+        { icon: Building2, label: 'Total', value: fmt(total), status: 'inactive' },
       ],
     };
     smallStats = [
       {
-        icon: CheckCircle2,
-        label: 'Items in Queue',
-        value: String(qItems.length),
-        sub: 'awaiting review',
-        color: '#0d7a3e',
+        icon: Clock,
+        label: 'Awaiting Review',
+        value: fmt(draft),
+        sub: 'with the Branch Admin',
+        color: '#b45309',
       },
       {
-        icon: Zap,
-        label: 'SLA Status',
-        value: breached > 0 ? 'At Risk' : 'Healthy',
-        sub: `${breached} breached`,
-        color: '#1a5fac',
+        icon: CheckCircle2,
+        label: 'Verified Companies',
+        value: fmt(verified),
+        sub: `of ${fmt(total)} total`,
+        color: '#0d7a3e',
       },
     ];
     pipeline = {
-      title: 'Daily Progress',
+      title: 'Registration Progress',
       items: [
         {
           icon: Clock,
-          label: 'Unclaimed Cases',
-          current: unclaimed,
-          total: Math.max(qItems.length, 1),
-          color: '#0d7a3e',
-        },
-        {
-          icon: Zap,
-          label: 'Cases In Review',
-          current: inReview,
-          total: Math.max(qItems.length, 1),
-          color: '#1a5fac',
+          label: 'Awaiting Review',
+          current: draft,
+          total: Math.max(total, 1),
+          color: '#b45309',
         },
         {
           icon: ShieldCheck,
-          label: 'SLA Breached',
-          current: breached,
-          total: Math.max(qItems.length, 1),
-          color: '#b45309',
+          label: 'Verified',
+          current: verified,
+          total: Math.max(total, 1),
+          color: '#0d7a3e',
         },
       ],
     };
+    activity = recentCompanies.items.map((c): ActivityItem => ({
+      icon: Building2,
+      action: 'Company Registered',
+      detail: c.legalName,
+      when: relativeDate(c.createdAt),
+      price: c.branchName ?? '',
+      status: c.status === 'VERIFIED' ? 'success' : c.status === 'DRAFT' ? 'pending' : 'info',
+    }));
+    chartValues = await countCompaniesOnboardedByMonth(actor, year);
+    chartLabel = 'Companies Registered';
   } else if (role === 'STAFF') {
-    const [r_all, r_active, r_draft, r_id_ver] = await Promise.all([
+    const [r_all, r_active, r_id_ver] = await Promise.all([
       listApplicants(actor, minQ('createdAt')),
-      listApplicants(actor, minQ('createdAt', { status: 'ACTIVE' })),
-      listApplicants(actor, minQ('createdAt', { status: 'DRAFT' })),
-      listApplicants(actor, minQ('createdAt', { identityStatus: 'VERIFIED' })),
+      listApplicants(actor, minQ('createdAt', { status: ['ACTIVE'] })),
+      listApplicants(actor, minQ('createdAt', { identityStatus: ['VERIFIED'] })),
     ]);
     main = {
       icon: Users,
@@ -669,7 +519,6 @@ export async function WelcomePanel({ role }: { role: Role }) {
       subItems: [
         { icon: Users, label: 'Total', value: fmt(r_all.meta.total), status: 'active' },
         { icon: CheckCircle2, label: 'Active', value: fmt(r_active.meta.total), status: 'active' },
-        { icon: Clock, label: 'Draft', value: fmt(r_draft.meta.total), status: 'active' },
         {
           icon: ShieldCheck,
           label: 'ID Verified',
@@ -711,24 +560,183 @@ export async function WelcomePanel({ role }: { role: Role }) {
           total: Math.max(r_all.meta.total, 1),
           color: '#1a5fac',
         },
+      ],
+    };
+    const recentApplicants = await listApplicants(actor, {
+      ...minQ('createdAt'),
+      pageSize: 5,
+      limit: 5,
+    });
+    activity = recentApplicants.data.map((a) => toApplicantActivity(a));
+    chartValues = await monthlyApplicantCounts(actor, year);
+    chartLabel = 'Applicants Registered';
+  } else if (role === 'INTERVIEWER_SCHEDULER') {
+    // Interviewer dashboard: real counts from listInterviews, the same
+    // branch-scoped list the Interviews page renders, plus the referrals
+    // that already left that list (FORWARDED + PASSED). Nothing here is
+    // invented: an empty pipeline renders zeros, not sample data.
+    const [interviews, referred, interviewMonths, pipelineCounts] = await Promise.all([
+      // Activity needs only the 5 most recent rows. The pipeline numbers
+      // come from the grouped count query (MEDIUM-2): deriving them from
+      // listInterviews rows meant every refresh loaded the whole
+      // unbounded pipeline. Every scheduled/postponed interview counts,
+      // not just future ones: a row whose time has passed but whose
+      // outcome is not recorded yet is still work.
+      listInterviews(actor, 5),
+      countInterviewerReferrals(actor),
+      monthlyInterviewCounts(actor, year),
+      interviewPipelineCounts(actor),
+    ]);
+    const toSchedule = pipelineCounts.toSchedule;
+    const scheduled = pipelineCounts.scheduled;
+    const upcomingToday = pipelineCounts.upcomingToday;
+    const passed = pipelineCounts.passed;
+    const failed = pipelineCounts.failed;
+    const total = pipelineCounts.total;
+    // Funnel denominator: pipeline rows in hand + referrals already made.
+    // Referred candidates are not in listInterviews, so without this the
+    // pipeline bars would share a denominator that excludes the funnel's
+    // own end state.
+    const funnelTotal = total + referred;
+    main = {
+      icon: Calendar,
+      label: 'Interviews to schedule',
+      value: fmt(toSchedule),
+      trend: {
+        dir: 'up',
+        text: `${fmt(upcomingToday)} today · ${fmt(passed)} passed awaiting referral`,
+      },
+      subTitle: 'Interview Pipeline',
+      subItems: [
+        { icon: Calendar, label: 'To schedule', value: fmt(toSchedule), status: 'active' },
         {
           icon: Clock,
-          label: 'Draft Profiles',
-          current: r_draft.meta.total,
-          total: Math.max(r_all.meta.total, 1),
-          color: '#b45309',
+          label: 'Upcoming today',
+          value: fmt(upcomingToday),
+          status: 'active',
+        },
+        {
+          icon: CheckCircle2,
+          label: 'Passed awaiting referral',
+          value: fmt(passed),
+          status: 'active',
+        },
+        {
+          icon: Users,
+          label: 'Failed / No-show',
+          value: fmt(failed),
+          status: 'inactive',
         },
       ],
     };
+    smallStats = [
+      {
+        icon: Calendar,
+        label: 'To schedule',
+        value: fmt(toSchedule),
+        sub: 'shortlisted candidates',
+        color: '#1a5fac',
+      },
+      {
+        icon: CheckCircle2,
+        label: 'Passed awaiting referral',
+        value: fmt(passed),
+        sub: 'refer them to the employer',
+        color: '#0f766e',
+      },
+    ];
+    pipeline = {
+      title: 'Interview Pipeline',
+      items: [
+        {
+          icon: Calendar,
+          label: 'To schedule',
+          current: toSchedule,
+          total: Math.max(funnelTotal, 1),
+          color: '#1a5fac',
+        },
+        {
+          icon: Clock,
+          label: 'Interviews scheduled',
+          current: scheduled,
+          total: Math.max(funnelTotal, 1),
+          color: '#0d7a3e',
+        },
+        {
+          icon: CheckCircle2,
+          label: 'Passed awaiting referral',
+          current: passed,
+          total: Math.max(funnelTotal, 1),
+          color: '#b45309',
+        },
+        {
+          icon: Users,
+          label: 'Failed / No-show',
+          current: failed,
+          total: Math.max(funnelTotal, 1),
+          color: '#be123c',
+        },
+        {
+          icon: Briefcase,
+          label: 'Referred to employer',
+          current: referred,
+          total: Math.max(funnelTotal, 1),
+          color: '#0f766e',
+        },
+      ],
+    };
+    const INTERVIEW_ACTIVITY: Record<string, { action: string; status: ActivityItem['status'] }> = {
+      SHORTLISTED: { action: 'Candidate shortlisted', status: 'info' },
+      INTERVIEW_SCHEDULED: { action: 'Interview scheduled', status: 'pending' },
+      INTERVIEW_POSTPONED: { action: 'Interview postponed', status: 'warning' },
+      INTERVIEW_CANCELLED: { action: 'Interview cancelled', status: 'info' },
+      INTERVIEW_PASSED: { action: 'Interview passed', status: 'success' },
+      INTERVIEW_FAILED: { action: 'Interview failed', status: 'warning' },
+    };
+    activity = interviews.slice(0, 5).map((i) => {
+      const a = INTERVIEW_ACTIVITY[i.status] ?? { action: 'Interview', status: 'info' as const };
+      return {
+        icon: Calendar,
+        action: a.action,
+        detail: i.applicantName,
+        when: relativeDate(i.updatedAt),
+        price: i.jobTitle,
+        status: a.status,
+      };
+    });
+    // Monthly chart: every interview-dated application in the branch,
+    // including ones that already left the pipeline (referred, hired).
+    // Bucketing listInterviews rows lost those months on referral.
+    chartValues = interviewMonths;
+    chartLabel = 'Interviews Scheduled';
   } else if (role === 'EMPLOYER') {
-    let jobs: { title: string; status: string; vacancies: number | null }[] = [];
-    try {
-      jobs = await listMyJobs(actor);
-    } catch {
-      /* no company yet */
+    // Employer dashboard: real counts over the employer's OWN postings
+    // only (see countEmployerCandidates / countHiresByMonth).
+    let candidateCounts = { referred: 0, hired: 0 };
+    if (!actor.companyId) {
+      // No company linked yet — an empty dashboard, not an error. Every
+      // helper below already returns zeros without a company, so skip the
+      // calls entirely instead of catching their absence.
+    } else {
+      // No try/catch here on purpose: a real failure (DB down, bad query)
+      // must surface as an error, not silently render as zeros.
+      // M2 hoist: fetch the own jobs once, then pass their ids into the
+      // count helpers instead of letting each re-query the same job list.
+      const visibleJobs = await listJobsForEmployer(actor);
+      const visibleJobIds = visibleJobs.map((j) => j.id);
+      const [candidates, hiresByMonth] = await Promise.all([
+        countEmployerCandidates(actor, visibleJobIds),
+        countHiresByMonth(actor, year, visibleJobIds),
+      ]);
+      jobs = visibleJobs;
+      candidateCounts = candidates;
+      chartValues = hiresByMonth;
     }
+    chartLabel = 'Hires Made';
     const activeJobs = jobs.filter((j) => j.status === 'OPEN');
-    const filled = jobs.map((j) => j.vacancies ?? 1);
+    // Real pipeline denominator: every vacancy slot across the employer's
+    // own postings.
+    const totalVacancies = jobs.reduce((sum, j) => sum + (j.vacancies ?? 0), 0);
     const jobItems: DashMain['subItems'] = activeJobs.slice(0, 4).map((j) => ({
       icon: Briefcase as LucideIcon,
       label: j.title,
@@ -741,24 +749,27 @@ export async function WelcomePanel({ role }: { role: Role }) {
       icon: Building2,
       label: 'Active Job Postings',
       value: String(activeJobs.length),
-      trend: { dir: 'up', text: `${jobs.length} total jobs posted` },
+      trend: {
+        dir: 'up',
+        text: `${jobs.length} job posting${jobs.length !== 1 ? 's' : ''}`,
+      },
       subTitle: 'By Position',
       subItems: jobItems,
     };
     smallStats = [
       {
-        icon: Users,
-        label: 'Total Jobs Posted',
-        value: String(jobs.length),
-        sub: 'all time',
-        color: '#1a5fac',
+        icon: Briefcase,
+        label: 'Open Jobs',
+        value: String(activeJobs.length),
+        sub: 'open now',
+        color: '#0f766e',
       },
       {
-        icon: Briefcase,
-        label: 'Open Positions',
-        value: String(activeJobs.length),
-        sub: 'accepting referrals',
-        color: '#0f766e',
+        icon: Building2,
+        label: 'Total Postings',
+        value: String(jobs.length),
+        sub: `${totalVacancies} vacancy slot${totalVacancies !== 1 ? 's' : ''}`,
+        color: '#1a5fac',
       },
     ];
     pipeline = {
@@ -774,15 +785,18 @@ export async function WelcomePanel({ role }: { role: Role }) {
         {
           icon: Users,
           label: 'Candidates Referred',
-          current: 0,
-          total: Math.max(activeJobs.length, 1),
+          // Was: candidates / active-job count — 5 candidates across 2 jobs
+          // rendered as 250%. Denominator is now total vacancies; the bar
+          // is clamped to 100% in the renderer regardless.
+          current: candidateCounts.referred,
+          total: Math.max(totalVacancies, 1),
           color: '#1a5fac',
         },
         {
           icon: CheckCircle2,
           label: 'Positions Filled',
-          current: 0,
-          total: Math.max(activeJobs.length, 1),
+          current: candidateCounts.hired,
+          total: Math.max(totalVacancies, 1),
           color: '#b45309',
         },
       ],
@@ -826,22 +840,46 @@ export async function WelcomePanel({ role }: { role: Role }) {
       subTitle: 'Profile Sections',
       subItems: secItems,
     };
+    const [myApplications, myNotifications] = await Promise.all([
+      listMyApplications(actor),
+      listMyNotifications(actor, { page: 1, pageSize: 5 }),
+    ]);
+    const upcomingInterviews = myApplications.filter(
+      (a) =>
+        a.status === 'INTERVIEW_SCHEDULED' && a.interviewAt && new Date(a.interviewAt) > new Date(),
+    );
+    const activeApplications = myApplications.filter(
+      (a) => !TERMINAL_APPLICATION_STATUSES.includes(a.status),
+    );
     smallStats = [
       {
         icon: Briefcase,
         label: 'Active Applications',
-        value: '—',
-        sub: 'coming in M10',
+        value: String(activeApplications.length),
+        sub: `${myApplications.filter((a) => a.status === 'SHORTLISTED').length} shortlisted of ${myApplications.length} total`,
         color: '#1a5fac',
       },
       {
         icon: Activity,
         label: 'Upcoming Interviews',
-        value: '—',
-        sub: 'coming in M11',
+        value: String(upcomingInterviews.length),
+        sub: upcomingInterviews.length > 0 ? 'scheduled' : 'none scheduled',
         color: '#0f766e',
       },
     ];
+    activity = myNotifications.items.map((n): ActivityItem => ({
+      icon: Bell,
+      action: n.title,
+      detail: n.body,
+      when: relativeDate(n.createdAt),
+      price: n.readAt ? 'Read' : 'Unread',
+      status: n.readAt ? 'info' : 'pending',
+    }));
+    chartValues = bucketByMonth(
+      myApplications.map((a) => a.createdAt),
+      year,
+    );
+    chartLabel = 'Applications';
     pipeline = {
       title: 'Your Progress',
       items: [
@@ -865,18 +903,39 @@ export async function WelcomePanel({ role }: { role: Role }) {
   }
 
   const actions = ROLE_ACTIONS[role];
-  const chart = ROLE_CHART[role];
-  const activity = ROLE_ACTIVITY[role];
+  const chart = { values: chartValues, peak: Math.max(...chartValues, 0), label: chartLabel };
+
+  /* ── Build activity list ──────────────────────────────────────── */
+  const JOB_STATUS_ACTIVITY: Record<string, ActivityItem['status']> = {
+    OPEN: 'success',
+    DRAFT: 'pending',
+    PAUSED: 'warning',
+    FILLED: 'success',
+    CLOSED: 'info',
+    EXPIRED: 'warning',
+  };
+  /* Employer activity is built from the employer's real jobs above; every
+     other role's activity was already built from real rows in its branch. */
+  if (role === 'EMPLOYER') {
+    activity = jobs.slice(0, 5).map((j) => ({
+      icon: Briefcase,
+      action:
+        j.status === 'FILLED'
+          ? 'Position Filled'
+          : j.status === 'OPEN'
+            ? 'Job Posted'
+            : 'Job Updated',
+      detail: j.title,
+      when: relativeDate(j.createdAt),
+      price: j.vacancies != null ? `${j.vacancies} slot${j.vacancies !== 1 ? 's' : ''}` : 'Open',
+      status: JOB_STATUS_ACTIVITY[j.status] ?? 'info',
+    }));
+  }
   const MainIcon = main.icon;
 
   const firstName = user.name.split(' ')[0];
   const now = new Date();
-  const dateStr = now.toLocaleDateString('en-PK', {
-    weekday: 'short',
-    day: 'numeric',
-    month: 'long',
-    year: 'numeric',
-  });
+  const dateStr = `${now.toLocaleDateString('en-PK', { weekday: 'short' })}, ${formatDate(now)}`;
   const scopeLabel =
     role === 'SUPER_ADMIN'
       ? actor.activeBranchId
@@ -889,6 +948,10 @@ export async function WelcomePanel({ role }: { role: Role }) {
 
   return (
     <div className="grid w-full gap-6">
+      {/* Live values: re-run the server data every 30s while this tab is
+          visible, and on focus — the numbers below are a snapshot at
+          load time without this. */}
+      <DashboardAutoRefresh />
       {/* ── Header ──────────────────────────────────────────────── */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
@@ -909,14 +972,6 @@ export async function WelcomePanel({ role }: { role: Role }) {
             <Calendar className="size-4" aria-hidden="true" />
             {dateStr}
           </span>
-          <NextLink
-            href="#"
-            className="flex items-center gap-1.5 rounded-xl px-4 py-2 text-sm font-semibold text-white"
-            style={{ background: '#0d7a3e' }}
-          >
-            <Download className="size-4" aria-hidden="true" />
-            Export
-          </NextLink>
         </div>
       </div>
 
@@ -939,13 +994,10 @@ export async function WelcomePanel({ role }: { role: Role }) {
                   {main.label}
                 </span>
               </div>
-              <CardActionMenu
-                items={[
-                  { label: 'View detailed report' },
-                  { label: 'Export as CSV' },
-                  { label: 'Refresh data' },
-                ]}
-              />
+              {/* Dead menu items ("View detailed report", "Export as CSV")
+                  removed — no report/export exists. Refresh re-runs the
+                  live server data. */}
+              <CardActionMenu items={[{ label: 'Refresh data', action: 'refresh' }]} />
             </div>
 
             <p className="numeric text-fg mb-1 text-4xl font-extrabold tracking-tight">
@@ -965,21 +1017,35 @@ export async function WelcomePanel({ role }: { role: Role }) {
               </span>
             </div>
 
-            <div className="mb-6 flex gap-2">
+            {/* Action buttons: no-wrap + wrapping row. Three flex-1 links
+                share ~470px, so the longest label ("Browse Applicants")
+                wrapped onto two lines mid-button. Labels now stay on one
+                line; on narrow screens a button drops to its own row
+                instead of wrapping its text. */}
+            <div className="mb-6 flex flex-wrap gap-2">
               <NextLink
                 href={actions.action1.href}
-                className="flex flex-1 items-center justify-center gap-2 rounded-xl py-2.5 text-sm font-semibold text-white"
+                className="flex flex-1 items-center justify-center gap-2 rounded-xl px-3 py-2.5 text-sm font-semibold whitespace-nowrap text-white"
                 style={{ background: '#0d7a3e' }}
               >
                 {actions.action1.label}
               </NextLink>
               <NextLink
                 href={actions.action2.href}
-                className="flex flex-1 items-center justify-center gap-2 rounded-xl border py-2.5 text-sm font-semibold"
+                className="flex flex-1 items-center justify-center gap-2 rounded-xl border px-3 py-2.5 text-sm font-semibold whitespace-nowrap"
                 style={{ borderColor: '#e8eeed', color: 'var(--fg)' }}
               >
                 {actions.action2.label}
               </NextLink>
+              {actions.action3 && (
+                <NextLink
+                  href={actions.action3.href}
+                  className="flex flex-1 items-center justify-center gap-2 rounded-xl border px-3 py-2.5 text-sm font-semibold whitespace-nowrap"
+                  style={{ borderColor: '#e8eeed', color: 'var(--fg)' }}
+                >
+                  {actions.action3.label}
+                </NextLink>
+              )}
             </div>
 
             <div className="mb-3 flex items-center justify-between">
@@ -1011,8 +1077,11 @@ export async function WelcomePanel({ role }: { role: Role }) {
                         />
                       </span>
                       <div className="min-w-0">
+                        {/* No truncate: "Verified Companies" was cut to
+                            "Verified Co..." in the half-width card. The
+                            label wraps to a second line instead. */}
                         <p
-                          className="truncate text-xs font-semibold"
+                          className="text-xs leading-snug font-semibold"
                           style={{ color: 'var(--fg)' }}
                         >
                           {sub.label}
@@ -1040,14 +1109,13 @@ export async function WelcomePanel({ role }: { role: Role }) {
               <p className="text-base font-bold" style={{ color: 'var(--fg)' }}>
                 {pipeline.title}
               </p>
-              <CardActionMenu
-                items={[{ label: 'View full breakdown' }, { label: 'Export report' }]}
-              />
+              <CardActionMenu items={[{ label: 'Refresh data', action: 'refresh' }]} />
             </div>
             <div className="grid gap-5">
               {pipeline.items.map((item, pi) => {
                 const PIcon = item.icon;
-                const pct = item.total > 0 ? Math.round((item.current / item.total) * 100) : 0;
+                const pct =
+                  item.total > 0 ? Math.min(100, Math.round((item.current / item.total) * 100)) : 0;
                 return (
                   <div key={pi}>
                     <div className="mb-2 flex items-center gap-3">
@@ -1121,7 +1189,7 @@ export async function WelcomePanel({ role }: { role: Role }) {
                         {s.label}
                       </span>
                     </div>
-                    <CardActionMenu items={[{ label: 'View details' }, { label: 'Export' }]} />
+                    <CardActionMenu items={[{ label: 'Refresh data', action: 'refresh' }]} />
                   </div>
                   <p className="numeric text-fg mb-1 text-3xl font-extrabold tracking-tight">
                     {s.value}
@@ -1154,6 +1222,7 @@ export async function WelcomePanel({ role }: { role: Role }) {
           <InteractiveBarChart
             values={chart.values}
             peak={chart.peak}
+            currentMonth={currentMonth}
             color="#0d7a3e"
             label={chart.label}
           />
@@ -1167,13 +1236,6 @@ export async function WelcomePanel({ role }: { role: Role }) {
               <p className="text-base font-bold" style={{ color: 'var(--fg)' }}>
                 Recent Activity
               </p>
-              <button
-                type="button"
-                className="flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold"
-                style={{ borderColor: '#e8eeed', color: 'var(--fg-muted)' }}
-              >
-                Filter <ChevronRight className="size-3" aria-hidden="true" />
-              </button>
             </div>
             <div
               className="grid gap-4 px-6 py-3 text-[11px] font-bold tracking-wider uppercase"
@@ -1189,6 +1251,11 @@ export async function WelcomePanel({ role }: { role: Role }) {
               <span>Detail</span>
               <span>Status</span>
             </div>
+            {activity.length === 0 ? (
+              <div className="px-6 py-8 text-center text-sm" style={{ color: 'var(--fg-muted)' }}>
+                No activity yet. Post a job to get started.
+              </div>
+            ) : null}
             <ul>
               {activity.map((item, idx) => {
                 const AIcon = item.icon;

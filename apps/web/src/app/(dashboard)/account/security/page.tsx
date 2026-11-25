@@ -1,6 +1,8 @@
-import { ShieldAlert, ShieldCheck } from 'lucide-react';
+import { ROLE_LABELS } from '@jobbank/shared';
+import { LogOut, ShieldAlert, ShieldCheck } from 'lucide-react';
 import { StatusPill } from '@/components/atoms';
 import { requireSignedIn, requiresTwoFactor } from '@/domains/auth';
+import { SessionsSection } from './SessionsSection';
 import { TwoFactorSetup } from './TwoFactorSetup';
 import { TwoFactorStatus } from './TwoFactorStatus';
 
@@ -31,8 +33,8 @@ export default async function SecurityPage({
         >
           <ShieldAlert className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
           <p>
-            Your role ({actor.roles.includes('SUPER_ADMIN') ? 'Super Admin' : 'Branch Admin'})
-            requires two-factor authentication. Set it up below to continue using the Job Bank.
+            Your role ({actor.roles.map((r) => ROLE_LABELS[r]).join(', ')}) requires two-factor
+            authentication. Set it up below to continue using the Job Bank.
           </p>
         </div>
       )}
@@ -53,6 +55,15 @@ export default async function SecurityPage({
         ) : (
           <TwoFactorSetup required={required} />
         )}
+      </section>
+
+      <section className="border-border bg-surface shadow-card grid gap-4 rounded-xl border p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-fg flex items-center gap-2 text-base font-semibold">
+            <LogOut className="text-primary size-5" aria-hidden="true" /> Signed-in sessions
+          </h2>
+        </div>
+        <SessionsSection />
       </section>
     </div>
   );

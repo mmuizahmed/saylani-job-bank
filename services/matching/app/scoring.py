@@ -1,9 +1,8 @@
 """Deterministic 0–100 scoring with a per-factor breakdown.
 
 Every factor returns points earned, its weight and a short human reason, e.g.
-"Required skills: 3/3 met" or "Location: 4.2 km (within preferred radius)".
-Missing optional data is NEUTRAL (full weight) so a thin profile is not
-punished for data the platform never asked for.
+"Required skills: 3/3 met". Missing optional data is NEUTRAL (full weight)
+so a thin profile is not punished for data the platform never asked for.
 """
 
 from collections.abc import Callable
@@ -26,11 +25,6 @@ from .weights import DEFAULT_WEIGHTS, Weights
 SemanticSim = Callable[[str, str], float]
 #: applicant_id → cosine(job text, profile text) in [0, 1]; None = no opinion
 TextFitSim = Callable[[str], float] | None
-
-
-def format_distance_km(distance_m: float) -> str:
-    """Display helper: distances are rounded to one decimal (10 900 m → 10.9 km)."""
-    return f"{distance_m / 1000:.1f} km"
 
 
 def _skill_match_count(
@@ -75,13 +69,16 @@ def _skill_reason(label: str, credits: float, exact: int, total: int) -> str:
     return f"{label}: {display}/{total} met"
 
 
-def _factor(name: str, points: float, weight: float, reason: str, **detail) -> FactorScore:
+def _factor(
+    name: str, points: float, weight: float, reason: str, has_data: bool = True, **detail
+) -> FactorScore:
     return FactorScore(
         factor=name,
         score=round(min(max(points, 0.0), weight), 2),
         weight=weight,
         reason=reason,
-        detail=detail,
+        has_data=has_data,
+        detail={"has_data": has_data, **detail},
     )
 
 
@@ -90,7 +87,9 @@ def score_required_skills(
 ) -> FactorScore:
     total = len(job.required_skills)
     if total == 0:
-        return _factor("required_skills", weight, weight, "No required skills defined")
+        return _factor(
+            "required_skills", weight, weight, "No required skills defined", has_data=False
+        )
     credits, exact = _skill_match_count(job.required_skills, applicant, semantic)
     return _factor(
         "required_skills",
@@ -108,7 +107,9 @@ def score_preferred_skills(
 ) -> FactorScore:
     total = len(job.preferred_skills)
     if total == 0:
-        return _factor("preferred_skills", weight, weight, "No preferred skills defined")
+        return _factor(
+            "preferred_skills", weight, weight, "No preferred skills defined", has_data=False
+        )
     credits, exact = _skill_match_count(job.preferred_skills, applicant, semantic)
     return _factor(
         "preferred_skills",
@@ -129,6 +130,7 @@ def score_experience(job, applicant, weight: float) -> FactorScore:
             weight,
             weight,
             f"Experience: {years:g} years (no minimum)",
+            has_data=False,
             years=years,
         )
     ratio = min(1.0, years / job.min_experience_years) if job.min_experience_years > 0 else 1.0
@@ -149,6 +151,7 @@ def score_education(job, applicant, weight: float) -> FactorScore:
             weight,
             weight,
             f"Education: {applicant.education_code or 'not recorded'} (no minimum)",
+            has_data=False,
         )
     if applicant.education_rank >= job.min_education_rank:
         return _factor(
@@ -171,7 +174,7 @@ def score_education(job, applicant, weight: float) -> FactorScore:
 def score_languages(job, applicant, weight: float) -> FactorScore:
     total = len(job.required_languages)
     if total == 0:
-        return _factor("languages", weight, weight, "No required languages")
+        return _factor("languages", weight, weight, "No required languages", has_data=False)
     met = sum(1 for lang in job.required_languages if lang in applicant.languages)
     return _factor(
         "languages",
@@ -183,37 +186,12 @@ def score_languages(job, applicant, weight: float) -> FactorScore:
     )
 
 
-def score_distance(job, applicant, weight: float) -> FactorScore:
-    if applicant.distance_m is None:
-        return _factor("distance", 0.0, weight, "Location: not on profile")
-    preferred = job.preferred_radius_m
-    maximum = max(job.max_radius_m, preferred)
-    distance = applicant.distance_m
-    label = format_distance_km(distance)
-    if distance <= preferred:
-        return _factor(
-            "distance",
-            weight,
-            weight,
-            f"Location: {label}; preferred radius {format_distance_km(preferred)}",
-            distance_km=round(distance / 1000, 1),
-        )
-    # Linear decay from the preferred radius out to the maximum.
-    remaining = max(0.0, (maximum - distance) / (maximum - preferred))
-    return _factor(
-        "distance",
-        weight * remaining,
-        weight,
-        f"Location: {label}; beyond preferred radius "
-        f"({format_distance_km(preferred)}–{format_distance_km(maximum)})",
-        distance_km=round(distance / 1000, 1),
-    )
-
-
 def score_salary(job, applicant, weight: float) -> FactorScore:
     expectation = applicant.min_salary_pkr
     if expectation is None or job.salary_max is None:
-        return _factor("salary", weight, weight, "Salary: no comparison data (neutral)")
+        return _factor(
+            "salary", weight, weight, "Salary: no comparison data (neutral)", has_data=False
+        )
     if job.salary_max >= expectation:
         return _factor(
             "salary",
@@ -259,7 +237,9 @@ def score_preferences(job, applicant, weight: float) -> FactorScore:
         labels.append(f"category {'ok' if category_fit else 'mismatch'}")
 
     if not fits:
-        return _factor("preferences", weight, weight, "Preferences: none recorded (neutral)")
+        return _factor(
+            "preferences", weight, weight, "Preferences: none recorded (neutral)", has_data=False
+        )
     average = sum(fits) / len(fits)
     return _factor(
         "preferences",
@@ -278,10 +258,14 @@ def score_text_fit(job, applicant, weight: float, fit: TextFitSim = None) -> Fac
     optional data. Linear ramp from floor (0 points) to ceiling (full weight).
     """
     if fit is None:
-        return _factor("text_fit", weight, weight, "Profile fit: no embeddings yet (neutral)")
+        return _factor(
+            "text_fit", weight, weight, "Profile fit: no embeddings yet (neutral)", has_data=False
+        )
     sim = fit(applicant.applicant_id)
     if sim is None:
-        return _factor("text_fit", weight, weight, "Profile fit: not embedded (neutral)")
+        return _factor(
+            "text_fit", weight, weight, "Profile fit: not embedded (neutral)", has_data=False
+        )
     span = TEXT_FIT_FULL_SIMILARITY - TEXT_FIT_FLOOR_SIMILARITY
     ratio = min(1.0, max(0.0, (sim - TEXT_FIT_FLOOR_SIMILARITY) / span))
     label = "strong" if ratio >= 0.8 else "partial" if ratio > 0 else "weak"
@@ -307,7 +291,6 @@ def score_candidate(
         score_experience(job, applicant, weights.experience),
         score_education(job, applicant, weights.education),
         score_languages(job, applicant, weights.languages),
-        score_distance(job, applicant, weights.distance),
         score_salary(job, applicant, weights.salary),
         score_preferences(job, applicant, weights.preferences),
         score_text_fit(job, applicant, weights.text_fit, fit),
@@ -315,23 +298,27 @@ def score_candidate(
     total = round(sum(f.score for f in factors))
     total = min(100, max(0, total))
     summary = "; ".join(f.reason for f in factors)
+    # Audit 2026-11-11 (L-10): completeness is the share of factors scored
+    # from real data. Weights are unchanged — a thin profile can still score
+    # high — but thin_profile flags the score as weakly evidenced.
+    completeness = round(sum(1 for f in factors if f.has_data) / len(factors), 2)
     return MatchResult(
         applicant_id=applicant.applicant_id,
         eligible=True,
         score=total,
-        distance_m=round(applicant.distance_m) if applicant.distance_m is not None else None,
         summary=summary,
         factors=factors,
+        completeness=completeness,
+        thin_profile=completeness < 0.5,
     )
 
 
 def sort_matches(matches: list[MatchResult]) -> list[MatchResult]:
-    """Score descending; ties by nearer distance, then applicant id (stable)."""
+    """Score descending; ties by applicant id (stable)."""
     return sorted(
         matches,
         key=lambda m: (
             -(m.score or 0),
-            m.distance_m if m.distance_m is not None else 2**31,
             m.applicant_id,
         ),
     )
